@@ -13,8 +13,10 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: Install clang 21 (required by libwebrtc)
+      - name: Install clang 21 and glib headers (required by libwebrtc)
         run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q libglib2.0-dev
           wget -q https://apt.llvm.org/llvm.sh
           sudo bash llvm.sh 21
           echo "CC=clang-21" >> "$GITHUB_ENV"

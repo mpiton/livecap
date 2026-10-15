@@ -86,7 +86,7 @@ To use webhooks, point your LiveKit project's webhook URL at `https://<agent>/we
 
 ## Building
 
-The LiveKit Rust SDK links a prebuilt libwebrtc that needs **clang 21 or later** (`webrtc-sys` checks it at build time):
+The LiveKit Rust SDK links a prebuilt libwebrtc that needs **clang 21 or later** (`webrtc-sys` checks it at build time) and the glib headers (`libglib2.0-dev` on Debian/Ubuntu):
 
 ```bash
 CC=clang-21 CXX=clang++-21 cargo build --release

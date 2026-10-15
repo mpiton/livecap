@@ -4,7 +4,7 @@ Thanks for helping. Small, focused pull requests are easiest to review.
 
 ## Setup
 
-1. Install Rust (stable, 1.88 or later) and **clang 21 or later**: the LiveKit SDK links a prebuilt libwebrtc that checks the compiler version.
+1. Install Rust (stable, 1.88 or later), the glib development headers (`libglib2.0-dev` on Debian/Ubuntu) and **clang 21 or later**: the LiveKit SDK links a prebuilt libwebrtc that checks the compiler version.
 2. Build and test:
    ```bash
    CC=clang-21 CXX=clang++-21 cargo build
