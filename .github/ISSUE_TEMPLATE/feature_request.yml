@@ -1,0 +1,20 @@
+name: Feature request
+description: Suggest an improvement or a new speech-to-text provider
+labels: ["enhancement", "triage"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do, and what gets in the way?
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+  - type: dropdown
+    id: importance
+    attributes:
+      label: How important is this for you?
+      options: [Nice to have, Important, Blocking]

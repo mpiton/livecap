@@ -1,0 +1,44 @@
+name: Bug report
+description: Something does not work as expected
+labels: ["bug", "triage"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, what you got instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Start livecap with ...
+        2. Join room ... from ...
+        3. ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: livecap version or commit
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system running livecap
+      options: [Linux, macOS, Windows, Docker, Other]
+    validations:
+      required: true
+  - type: input
+    id: livekit
+    attributes:
+      label: LiveKit server (Cloud or self-hosted, version)
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Run with RUST_LOG=debug. Remove API keys and personal data.
+      render: shell
