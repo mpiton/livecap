@@ -27,4 +27,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
+      - name: Download livekit-server for the end-to-end tests (pinned, checksum verified)
+        env:
+          LIVEKIT_VERSION: 1.13.11
+          LIVEKIT_SHA256: 1e9ee90ca301e1842b2887fc77cb122759756a9c8aeb4334ee91de3325ec43fb
+        run: |
+          dir="$RUNNER_TEMP/livekit"
+          archive="livekit_${LIVEKIT_VERSION}_linux_amd64.tar.gz"
+          mkdir -p "$dir"
+          curl -fsSL -o "$dir/$archive" "https://github.com/livekit/livekit/releases/download/v${LIVEKIT_VERSION}/$archive"
+          echo "${LIVEKIT_SHA256}  $dir/$archive" | sha256sum --check --strict
+          tar -xzf "$dir/$archive" -C "$dir" livekit-server
+          echo "LIVEKIT_SERVER_BIN=$dir/livekit-server" >> "$GITHUB_ENV"
+      # Unit tests, the Gladia client against the fake Gladia, and the agent against the fake
+      # Gladia and livekit-server --dev. On CI a missing LIVEKIT_SERVER_BIN fails the tests.
+      - run: cargo test --locked
