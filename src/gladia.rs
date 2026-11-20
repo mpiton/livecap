@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::json;
@@ -229,11 +229,15 @@ struct Translated {
 
 /// Maps one Gladia WebSocket message to a caption event (`Ok(None)` for messages we don't use).
 pub fn parse_message(raw: &str) -> Result<Option<CaptionEvent>> {
-    let envelope: Envelope = serde_json::from_str(raw)?;
+    // Neither the raw message nor serde's error text (which quotes values) may end up in an
+    // error: both can hold caption text, and errors are logged.
+    let envelope: Envelope = serde_json::from_str(raw)
+        .map_err(|err| anyhow!("malformed Gladia message ({:?})", err.classify()))?;
     if envelope.kind == "error" || envelope.error.is_some() {
+        let detail = envelope.error.map(|e| e.to_string()).unwrap_or_default();
         bail!(
             "Gladia error: {}",
-            raw.chars().take(300).collect::<String>()
+            detail.chars().take(300).collect::<String>()
         );
     }
     let Some(data) = envelope.data else {
@@ -317,6 +321,14 @@ mod tests {
         assert!(parse_message(r#"{"type":"speech_start","data":{}}"#)?.is_none());
         assert!(parse_message(r#"{"type":"error","error":{"message":"boom"}}"#).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn errors_never_carry_caption_text() {
+        let raw = r#"{"type":"error","error":{"code":"limit"},"data":{"utterance":{"text":"private words"}}}"#;
+        let err = parse_message(raw).err().map(|e| format!("{e:#}")).unwrap_or_default();
+        assert!(err.contains("limit"), "{err}");
+        assert!(!err.contains("private"), "{err}");
     }
 
     #[test]
