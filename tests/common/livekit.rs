@@ -21,6 +21,8 @@ use tokio::task::JoinHandle;
 /// API key and secret of `livekit-server --dev`.
 pub const API_KEY: &str = "devkey";
 pub const API_SECRET: &str = "secret";
+/// `RUST_LOG` the agent runs with in tests.
+pub const LOG_FILTER: &str = "debug,livekit=info,livekit_api=info,libwebrtc=info";
 /// Bearer secret the agent is started with.
 pub const JOIN_SECRET: &str = "test-join-secret";
 
@@ -172,8 +174,10 @@ impl AgentProcess {
             .env("GLADIA_API_URL", gladia_url)
             .env("LIVECAP_JOIN_SECRET", JOIN_SECRET)
             .env("LIVECAP_LISTEN_ADDR", format!("127.0.0.1:{port}"))
-            // Everything the agent and its libraries log, so the log test sees all of it.
-            .env("RUST_LOG", "debug")
+            // Everything the agent logs, at the most verbose level an operator would use. The
+            // LiveKit SDK stays at `info`: at `debug` it prints whole signalling messages
+            // (participant attributes, TURN credentials), which the deployment guide warns about.
+            .env("RUST_LOG", LOG_FILTER)
             .envs(extra.iter().copied())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
