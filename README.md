@@ -16,7 +16,7 @@ listener ◄──captions──┴──── data message ───┘
 
 ## Status
 
-Early, working prototype. Tested end to end against a local `livekit-server --dev`, two browsers and a fake Gladia server; first real-world tests France ↔ Madagascar are next. Expect breaking changes.
+Young, but meant for production: v0.2.0 adds a configurable Gladia region, several languages per speaker, deletion of every Gladia session, a `join` that answers only once the agent is in the room, a room cap, a graceful stop and recovery from LiveKit outages. CI runs every change against a fake Gladia and a local `livekit-server --dev`. Tagged releases publish a Linux x86_64 binary; see [docs/deploy.md](docs/deploy.md) to run it with systemd and Caddy. Expect breaking changes before 1.0.
 
 ## How it works
 
@@ -121,6 +121,8 @@ The LiveKit Rust SDK links a prebuilt libwebrtc that needs **clang 21 or later**
 CC=clang-21 CXX=clang++-21 cargo build --release
 ```
 
+To deploy without compiling, use the binary attached to each [release](https://github.com/mpiton/livecap/releases) (`livecap-x86_64-unknown-linux-gnu`, with its `.sha256`) and follow [docs/deploy.md](docs/deploy.md).
+
 ## Testing
 
 ```bash
@@ -150,8 +152,8 @@ With Gladia's Starter plan (October 2026): €0.68 per hour of audio plus €0.0
 ## Roadmap
 
 - A `SpeechProvider` trait, with Deepgram as a second backend.
-- Dockerfile and a deployment example.
 - Per-listener target languages for rooms with more than two people.
+- A Dockerfile, for those who deploy containers rather than the systemd setup of [docs/deploy.md](docs/deploy.md).
 
 ## License
 

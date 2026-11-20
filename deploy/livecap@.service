@@ -1,0 +1,55 @@
+# livecap, one instance per environment: livecap@preprod, livecap@production...
+# Each instance runs as its own user (livecap-<environment>), with its own keys in
+# /etc/livecap/<environment>.env and its own binaries under /opt/livecap/<environment>.
+# See docs/deploy.md.
+
+[Unit]
+Description=livecap captions agent (%i)
+Documentation=https://github.com/mpiton/livecap/blob/main/docs/deploy.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=livecap-%i
+Group=livecap-%i
+# Read by systemd (as root) before dropping privileges: the file stays root-only (0600).
+EnvironmentFile=/etc/livecap/%i.env
+ExecStart=/opt/livecap/%i/current/livecap serve
+Restart=always
+RestartSec=2
+
+# Graceful stop: on SIGTERM livecap takes no new room, lets the calls in progress end (at most
+# LIVECAP_DRAIN_TIMEOUT_SECS, 2 h by default), deletes their Gladia sessions, then exits.
+# The stop timeout must stay above the drain timeout, or systemd kills calls in progress.
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=2h 5min
+
+# Logs go to the journal; livecap never logs caption text (see docs/deploy.md, Logs).
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=livecap-%i
+
+# Hardening: livecap only needs the network.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
