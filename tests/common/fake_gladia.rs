@@ -164,6 +164,10 @@ async fn accept_websockets(listener: TcpListener, shared: Shared) {
 
 async fn session(stream: tokio::net::TcpStream, shared: Shared) {
     let mut path = String::new();
+    #[expect(
+        clippy::result_large_err,
+        reason = "the callback signature is fixed by tungstenite"
+    )]
     let callback = |request: &Request, response: Response| {
         path = request.uri().path().to_owned();
         Ok(response)
@@ -198,7 +202,7 @@ async fn session(stream: tokio::net::TcpStream, shared: Shared) {
                     let _ = sink.send(Message::Close(Some(frame))).await;
                     return;
                 }
-                if chunks % 25 == 0 {
+                if chunks.is_multiple_of(25) {
                     utterance += 1;
                     for text in script(&format!("{id}-u{utterance}")) {
                         if sink.send(Message::text(text)).await.is_err() {
