@@ -30,7 +30,8 @@ Early, working prototype. Tested end to end against a local `livekit-server --de
 4. It publishes, as JSON data messages:
    - on topic `livecap.self`, to the speaker only: their own live transcript (partials and finals);
    - on topic `livecap.captions`, to everyone else: the translation (or the final transcript when not translating).
-5. It leaves when the last participant does.
+5. When a speaker leaves (or their track ends, the room empties, the agent stops, or Gladia fails the session), the agent closes their Gladia session and deletes it (`DELETE /v2/live/{id}`), so Gladia keeps neither the audio nor the transcript. A refused deletion is retried with a doubling delay for about 15 seconds; only the session id is logged.
+6. It leaves when the last participant does.
 
 Short utterances that speech models typically invent on silence ("Thank you.", "Merci.", "T-Series"…) are flagged `suspect` and never sent to listeners.
 

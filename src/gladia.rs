@@ -13,6 +13,10 @@ use tracing::{debug, info, warn};
 use crate::audio::SAMPLE_RATE;
 
 const MAX_RECONNECTS: u32 = 5;
+/// Attempts to delete a session before giving up. Gladia answers 409 until a finished session
+/// has been traced, which takes a few seconds; 6 attempts from 500 ms, doubling, span about 15 s.
+const DELETE_ATTEMPTS: u32 = 6;
+const DELETE_FIRST_DELAY: Duration = Duration::from_millis(500);
 /// How long to wait for the last results after `stop_recording`.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -23,6 +27,8 @@ pub struct GladiaClient {
     api_key: String,
     region: String,
     speech_threshold: f32,
+    delete_attempts: u32,
+    delete_first_delay: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -60,6 +66,63 @@ impl GladiaClient {
             api_key: api_key.to_owned(),
             region: region.to_owned(),
             speech_threshold,
+            delete_attempts: DELETE_ATTEMPTS,
+            delete_first_delay: DELETE_FIRST_DELAY,
+        }
+    }
+
+    /// Sets how many times [`Self::delete`] tries, and its first delay (doubled at each retry).
+    #[must_use]
+    pub fn with_delete_retries(mut self, attempts: u32, first_delay: Duration) -> Self {
+        self.delete_attempts = attempts.max(1);
+        self.delete_first_delay = first_delay;
+        self
+    }
+
+    /// Deletes a session (`DELETE /v2/live/{id}`), so Gladia keeps neither audio nor transcript.
+    ///
+    /// Retries with a doubling delay while Gladia refuses or is unreachable. A session Gladia no
+    /// longer knows (404) counts as deleted.
+    ///
+    /// # Errors
+    ///
+    /// Every attempt failed.
+    pub async fn delete(&self, id: &str) -> Result<()> {
+        let mut delay = self.delete_first_delay;
+        let mut attempt = 1;
+        loop {
+            match self.delete_once(id).await {
+                Ok(()) => return Ok(()),
+                Err(err) if attempt >= self.delete_attempts => {
+                    return Err(err.context(format!("{attempt} attempts")));
+                }
+                Err(err) => {
+                    debug!(session = %id, attempt, error = %format!("{err:#}"), "Gladia session deletion failed, retrying");
+                }
+            }
+            tokio::time::sleep(delay).await;
+            delay = delay.saturating_mul(2);
+            attempt += 1;
+        }
+    }
+
+    async fn delete_once(&self, id: &str) -> Result<()> {
+        let mut url = reqwest::Url::parse(&self.base_url).context("invalid GLADIA_API_URL")?;
+        url.path_segments_mut()
+            .map_err(|()| anyhow!("invalid GLADIA_API_URL"))?
+            .extend(["v2", "live", id]);
+        let response = self
+            .http
+            .delete(url)
+            .header("x-gladia-key", &self.api_key)
+            .send()
+            .await
+            .context("Gladia unreachable")?;
+        let status = response.status();
+        if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
+            Ok(())
+        } else {
+            bail!("Gladia answered {status}")
         }
     }
 
@@ -202,7 +265,13 @@ pub async fn run_session(
                 } => match message {
                     Some(Ok(Message::Text(text))) => forward(text.as_str(), &events).await,
                     Some(Ok(Message::Close(_))) | None if stopping => return Ok(()),
-                    Some(Ok(Message::Close(_))) | None => break,
+                    // Gladia closes the WebSocket itself only when the session is over (an error,
+                    // or its maximum duration): reconnecting to it would fail the same way.
+                    Some(Ok(Message::Close(frame))) => {
+                        let code = frame.map_or(0, |f| u16::from(f.code));
+                        bail!("Gladia closed session {} (code {code})", session.id);
+                    }
+                    None => break,
                     Some(Ok(_)) => {}
                     Some(Err(_)) if stopping => return Ok(()),
                     Some(Err(err)) => {

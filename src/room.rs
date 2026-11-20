@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -10,7 +11,7 @@ use livekit::prelude::*;
 use livekit::webrtc::audio_stream::native::NativeAudioStream;
 use livekit_api::access_token::{AccessToken, VideoGrants};
 use serde::Serialize;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, Notify, mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
@@ -27,10 +28,51 @@ pub const TOPIC_SELF: &str = "livecap.self";
 /// Audio chunks buffered per speaker before older ones are dropped (about 4 s).
 const AUDIO_BUFFER: usize = 100;
 
+/// How long [`Agent::shutdown`] waits for the open Gladia sessions to be deleted. Covers the
+/// last results (3 s) and the deletion retries (about 15 s).
+const SESSIONS_DELETION_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub struct Agent {
     config: Config,
     gladia: GladiaClient,
     active_rooms: Mutex<HashSet<String>>,
+    sessions: Arc<Gauge>,
+    /// Set to `true` to make every room leave now.
+    leave: watch::Sender<bool>,
+}
+
+/// A count that can be awaited until it drops to zero.
+#[derive(Debug, Default)]
+pub struct Gauge {
+    count: AtomicUsize,
+    changed: Notify,
+}
+
+impl Gauge {
+    pub fn get(&self) -> usize {
+        self.count.load(Ordering::SeqCst)
+    }
+
+    fn increment(&self) {
+        self.count.fetch_add(1, Ordering::SeqCst);
+        self.changed.notify_waiters();
+    }
+
+    fn decrement(&self) {
+        self.count.fetch_sub(1, Ordering::SeqCst);
+        self.changed.notify_waiters();
+    }
+
+    /// Waits until the count is zero.
+    pub async fn zero(&self) {
+        loop {
+            let changed = self.changed.notified();
+            if self.get() == 0 {
+                return;
+            }
+            changed.await;
+        }
+    }
 }
 
 /// What the browser receives, as JSON, on [`TOPIC_CAPTIONS`] and [`TOPIC_SELF`].
@@ -67,7 +109,28 @@ impl Agent {
             config,
             gladia,
             active_rooms: Mutex::new(HashSet::new()),
+            sessions: Arc::new(Gauge::default()),
+            leave: watch::channel(false).0,
         })
+    }
+
+    /// Gladia sessions opened and not yet deleted.
+    pub fn open_sessions(&self) -> usize {
+        self.sessions.get()
+    }
+
+    /// Leaves every room now and waits until their Gladia sessions are deleted.
+    pub async fn shutdown(&self) {
+        self.leave.send_replace(true);
+        if tokio::time::timeout(SESSIONS_DELETION_TIMEOUT, self.sessions.zero())
+            .await
+            .is_err()
+        {
+            warn!(
+                sessions = self.sessions.get(),
+                "Gladia sessions still open at exit"
+            );
+        }
     }
 
     pub fn identity(&self) -> &str {
@@ -118,7 +181,13 @@ impl Agent {
         info!(room = room_name, "agent joined");
 
         let mut speakers: HashMap<ParticipantIdentity, Speaker> = HashMap::new();
-        while let Some(event) = events.recv().await {
+        let mut leave = self.leave.subscribe();
+        loop {
+            let event = tokio::select! {
+                event = events.recv() => event,
+                _ = leave.wait_for(|leave| *leave) => None,
+            };
+            let Some(event) = event else { break };
             match event {
                 RoomEvent::TrackSubscribed {
                     track: RemoteTrack::Audio(track),
@@ -208,11 +277,21 @@ impl Agent {
         let (audio_tx, audio_rx) = mpsc::channel::<Vec<u8>>(AUDIO_BUFFER);
         let (event_tx, event_rx) = mpsc::channel::<CaptionEvent>(64);
 
+        // The session ends when the audio channel closes (speaker gone, room left) or on error;
+        // either way it is then deleted. Only its id is logged.
+        self.sessions.increment();
+        let sessions = Arc::clone(&self.sessions);
+        let gladia = self.gladia.clone();
         let session_id = session.id.clone();
         tokio::spawn(async move {
             if let Err(err) = run_session(session, audio_rx, event_tx).await {
                 warn!(session = %session_id, error = %format!("{err:#}"), "Gladia session ended");
             }
+            match gladia.delete(&session_id).await {
+                Ok(()) => info!(session = %session_id, "Gladia session deleted"),
+                Err(_) => warn!(session = %session_id, "Gladia session not deleted, giving up"),
+            }
+            sessions.decrement();
         });
         tokio::spawn(publish_captions(
             room,

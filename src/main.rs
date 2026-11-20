@@ -3,10 +3,13 @@
 //! `livecap serve` waits for LiveKit webhooks (or `POST /rooms/{room}/join`) and joins
 //! rooms as a hidden participant. `livecap join <room>` joins one room and exits when it empties.
 
+use std::sync::Arc;
+
 use anyhow::{Context, Result, bail};
 use livecap::config::Config;
 use livecap::room::Agent;
 use livecap::server;
+use tokio::signal::unix::{SignalKind, signal};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -34,7 +37,17 @@ async fn main() -> Result<()> {
             if !server::valid_room_name(&room) {
                 bail!("invalid room name");
             }
-            Agent::new(config).run(&room).await
+            let agent = Agent::new(config);
+            let run = tokio::spawn({
+                let agent = Arc::clone(&agent);
+                async move { agent.run(&room).await }
+            });
+            tokio::select! {
+                result = run => return result.context("agent task failed")?,
+                signal = stop_signal() => signal?,
+            }
+            agent.shutdown().await;
+            Ok(())
         }
         Some(other) => bail!("unknown command `{other}` (expected `serve` or `join <room>`)"),
     }
@@ -42,8 +55,9 @@ async fn main() -> Result<()> {
 
 async fn serve(config: Config) -> Result<()> {
     let addr = config.listen_addr.clone();
+    let agent = Agent::new(config.clone());
     let app = server::router(
-        Agent::new(config.clone()),
+        Arc::clone(&agent),
         &config.livekit_api_key,
         &config.livekit_api_secret,
         config.join_secret.clone(),
@@ -52,5 +66,26 @@ async fn serve(config: Config) -> Result<()> {
         .await
         .with_context(|| format!("cannot listen on {addr}"))?;
     tracing::info!(%addr, "captions agent ready");
-    axum::serve(listener, app).await.context("server stopped")
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    tokio::select! {
+        result = server => {
+            result.context("server task failed")?.context("server stopped")?;
+            bail!("server stopped");
+        }
+        signal = stop_signal() => signal?,
+    }
+    tracing::info!("stop requested, leaving rooms");
+    agent.shutdown().await;
+    tracing::info!("stopped");
+    Ok(())
+}
+
+/// Resolves on SIGTERM (systemd stop) or SIGINT (Ctrl-C).
+async fn stop_signal() -> Result<()> {
+    let mut terminate = signal(SignalKind::terminate()).context("cannot listen for SIGTERM")?;
+    tokio::select! {
+        _ = terminate.recv() => {}
+        result = tokio::signal::ctrl_c() => result.context("cannot listen for SIGINT")?,
+    }
+    Ok(())
 }

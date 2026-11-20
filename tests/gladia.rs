@@ -2,6 +2,8 @@
 
 mod common;
 
+use std::time::Duration;
+
 use common::fake_gladia::FakeGladia;
 use livecap::gladia::GladiaClient;
 use serde_json::{Value, json};
@@ -79,4 +81,38 @@ async fn no_translation_when_the_reader_reads_the_only_spoken_language() {
     assert_eq!(body, expected_body(&["fr"], false, None));
     let (body, _) = opened_with("eu-west", &["fr"], None).await;
     assert_eq!(body, expected_body(&["fr"], false, None));
+}
+
+#[tokio::test]
+async fn deleting_a_session_calls_delete_with_its_id() {
+    let gladia = FakeGladia::start().await;
+    let client = GladiaClient::new(&gladia.url(), "key-1", "eu-west", 0.75);
+    let session = client.open(&langs(&["fr"]), None).await.unwrap();
+    client.delete(&session.id).await.unwrap();
+    assert_eq!(gladia.calls().deleted, vec![session.id]);
+}
+
+#[tokio::test]
+async fn a_refused_deletion_is_retried_until_it_succeeds() {
+    let gladia = FakeGladia::start().await;
+    let client = GladiaClient::new(&gladia.url(), "key-1", "eu-west", 0.75)
+        .with_delete_retries(4, Duration::from_millis(20));
+    gladia.refuse_next_deletes(2);
+    client.delete("session-9").await.unwrap();
+    let calls = gladia.calls();
+    assert_eq!(calls.delete_attempts.len(), 3);
+    assert_eq!(calls.deleted, vec!["session-9".to_owned()]);
+}
+
+#[tokio::test]
+async fn deletion_gives_up_after_a_bounded_number_of_attempts() {
+    let gladia = FakeGladia::start().await;
+    let client = GladiaClient::new(&gladia.url(), "key-1", "eu-west", 0.75)
+        .with_delete_retries(3, Duration::from_millis(20));
+    gladia.refuse_next_deletes(100);
+    let started = std::time::Instant::now();
+    assert!(client.delete("session-9").await.is_err());
+    assert_eq!(gladia.calls().delete_attempts.len(), 3);
+    // Delays grow: 20 ms, then 40 ms.
+    assert!(started.elapsed() >= Duration::from_millis(60));
 }

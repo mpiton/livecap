@@ -6,8 +6,10 @@ mod common;
 
 use std::time::Duration;
 
-use common::fake_gladia::{FakeGladia, TRANSCRIPT, TRANSLATION};
-use common::livekit::{AgentProcess, Listener, LiveKitServer, Speaker, require_livekit};
+use common::fake_gladia::{Behavior, FakeGladia, TRANSCRIPT, TRANSLATION};
+use common::livekit::{
+    AgentProcess, Listener, LiveKitServer, Speaker, require_livekit, wait_until,
+};
 
 const CAPTIONS: &str = "livecap.captions";
 const WAIT: Duration = Duration::from_secs(20);
@@ -82,8 +84,9 @@ async fn no_transcript_or_translation_text_reaches_the_logs() {
         assert!(listener.next(WAIT).await.is_some(), "no caption arrived");
     }
     speaker.leave().await;
-    tokio::time::sleep(Duration::from_secs(4)).await;
+    wait_until(WAIT, || async { !gladia.calls().deleted.is_empty() }).await;
     listener.leave().await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
 
     let logs = agent.logs();
     assert!(
@@ -156,7 +159,7 @@ async fn an_invalid_language_leaves_the_track_uncaptioned_and_the_agent_running(
         ],
     )
     .await;
-    common::livekit::wait_until(WAIT, || async { agent.logs().contains("no captions") }).await;
+    wait_until(WAIT, || async { agent.logs().contains("no captions") }).await;
     assert!(gladia.calls().opens.is_empty());
     let logs = agent.logs();
     assert!(
@@ -183,6 +186,79 @@ async fn an_invalid_language_leaves_the_track_uncaptioned_and_the_agent_running(
     );
 
     empty.leave().await;
+    speaker.leave().await;
+    listener.leave().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_gladia_session_is_deleted_when_its_speaker_leaves() {
+    let Some(bin) = require_livekit("the_gladia_session_is_deleted_when_its_speaker_leaves") else {
+        return;
+    };
+    let _serial = common::LIVEKIT_LOCK.lock().await;
+    let livekit = LiveKitServer::start(bin).await;
+    let gladia = FakeGladia::start().await;
+    let agent = AgentProcess::start(&livekit.url(), &gladia.url(), &[]).await;
+
+    let (speaker, mut listener) =
+        call(&livekit, &agent, "leaving", &[("livecap.lang", "en")]).await;
+    assert!(listener.next(WAIT).await.is_some(), "no caption arrived");
+    assert!(gladia.calls().deleted.is_empty());
+    speaker.leave().await;
+    wait_until(WAIT, || async { gladia.calls().deleted == ["session-1"] }).await;
+    let logs = agent.logs();
+    assert!(
+        logs.contains("session-1"),
+        "the session id is not logged:\n{logs}"
+    );
+    listener.leave().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_gladia_session_is_deleted_after_gladia_fails_it() {
+    let Some(bin) = require_livekit("the_gladia_session_is_deleted_after_gladia_fails_it") else {
+        return;
+    };
+    let _serial = common::LIVEKIT_LOCK.lock().await;
+    let livekit = LiveKitServer::start(bin).await;
+    let gladia = FakeGladia::start().await;
+    gladia.set_behavior(Behavior::CloseWithError);
+    gladia.refuse_next_deletes(1);
+    let agent = AgentProcess::start(&livekit.url(), &gladia.url(), &[]).await;
+
+    let (speaker, listener) = call(&livekit, &agent, "failing", &[("livecap.lang", "en")]).await;
+    wait_until(WAIT, || async { gladia.calls().deleted == ["session-1"] }).await;
+    assert_eq!(
+        gladia.calls().delete_attempts.len(),
+        2,
+        "the refused deletion was not retried"
+    );
+    speaker.leave().await;
+    listener.leave().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stopping_the_agent_deletes_the_sessions_still_open() {
+    let Some(bin) = require_livekit("stopping_the_agent_deletes_the_sessions_still_open") else {
+        return;
+    };
+    let _serial = common::LIVEKIT_LOCK.lock().await;
+    let livekit = LiveKitServer::start(bin).await;
+    let gladia = FakeGladia::start().await;
+    let mut agent = AgentProcess::start(
+        &livekit.url(),
+        &gladia.url(),
+        &[("LIVECAP_DRAIN_TIMEOUT_SECS", "1")],
+    )
+    .await;
+
+    let (speaker, mut listener) =
+        call(&livekit, &agent, "stopping", &[("livecap.lang", "en")]).await;
+    assert!(listener.next(WAIT).await.is_some(), "no caption arrived");
+    agent.sigterm();
+    let status = agent.wait_exit(WAIT).await.expect("the agent did not exit");
+    assert!(status.success(), "exit status {status}");
+    assert_eq!(gladia.calls().deleted, ["session-1"]);
     speaker.leave().await;
     listener.leave().await;
 }
