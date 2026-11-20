@@ -74,8 +74,13 @@ async fn serve(config: Config) -> Result<()> {
         }
         signal = stop_signal() => signal?,
     }
-    tracing::info!("stop requested, leaving rooms");
-    agent.shutdown().await;
+    tracing::info!("stop requested");
+    let hurry = async {
+        if stop_signal().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+    agent.drain(config.drain_timeout, hurry).await;
     tracing::info!("stopped");
     Ok(())
 }

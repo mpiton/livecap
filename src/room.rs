@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -34,6 +34,16 @@ pub const JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// Timeout of one call to LiveKit's server API.
 const LIVEKIT_API_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Reconnection attempts after the LiveKit SDK gave up on a connection (it retries for about
+/// 45 s itself). With [`reconnect_delay`] they span about two minutes.
+const RECONNECT_ATTEMPTS: u32 = 10;
+/// Consecutive checks finding the room gone before the agent stops trying. More than one, so a
+/// room that is being recreated by people reconnecting is not given up on.
+const ROOM_GONE_CHECKS: u32 = 3;
+/// How long the agent stays in a room with nobody else, e.g. one LiveKit recreated when the agent
+/// reconnected. Matches LiveKit's default `departure_timeout`.
+const ALONE_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// How long [`Agent::shutdown`] waits for the open Gladia sessions to be deleted. Covers the
 /// last results (3 s) and the deletion retries (about 15 s).
 const SESSIONS_DELETION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -46,6 +56,8 @@ pub struct Agent {
     rooms: Mutex<HashMap<String, watch::Receiver<RoomState>>>,
     rooms_changed: Notify,
     sessions: Arc<Gauge>,
+    /// Set once the agent is stopping: no new room.
+    draining: AtomicBool,
     /// Set to `true` to make every room leave now.
     leave: watch::Sender<bool>,
 }
@@ -57,6 +69,8 @@ pub enum JoinError {
     Full,
     /// The room does not exist, or LiveKit refused or did not answer in time.
     JoinFailed,
+    /// The agent is stopping: it finishes the current calls and takes no new room.
+    Draining,
 }
 
 impl JoinError {
@@ -64,6 +78,7 @@ impl JoinError {
         match self {
             Self::Full => "full",
             Self::JoinFailed => "join-failed",
+            Self::Draining => "draining",
         }
     }
 }
@@ -79,9 +94,19 @@ impl std::error::Error for JoinError {}
 /// Load reported by `/health`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Load {
+    pub draining: bool,
     pub rooms: usize,
     pub sessions: usize,
     pub max_rooms: usize,
+}
+
+/// How one LiveKit connection to a room ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ended {
+    /// The call is over or the agent was told to leave.
+    Finished,
+    /// The connection dropped: try again while the room exists.
+    Dropped,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -162,6 +187,7 @@ impl Agent {
             rooms: Mutex::new(HashMap::new()),
             rooms_changed: Notify::new(),
             sessions: Arc::new(Gauge::default()),
+            draining: AtomicBool::new(false),
             leave: watch::channel(false).0,
         })
     }
@@ -172,6 +198,7 @@ impl Agent {
 
     pub async fn load(&self) -> Load {
         Load {
+            draining: self.draining.load(Ordering::SeqCst),
             rooms: self.rooms.lock().await.len(),
             sessions: self.sessions.get(),
             max_rooms: self.config.max_rooms,
@@ -187,6 +214,29 @@ impl Agent {
             }
             changed.await;
         }
+    }
+
+    /// Stops taking rooms, lets the current calls finish for at most `deadline`, then leaves
+    /// whatever is left and waits until the Gladia sessions are deleted.
+    ///
+    /// Resolves early, leaving at once, if `hurry` resolves first (a second stop signal).
+    pub async fn drain(&self, deadline: Duration, hurry: impl Future<Output = ()>) {
+        self.draining.store(true, Ordering::SeqCst);
+        let load = self.load().await;
+        info!(
+            rooms = load.rooms,
+            deadline_secs = deadline.as_secs(),
+            "draining: no new room, waiting for the calls to end"
+        );
+        tokio::select! {
+            result = tokio::time::timeout(deadline, self.idle()) => {
+                if result.is_err() {
+                    info!("drain deadline reached, leaving the remaining rooms");
+                }
+            }
+            () = hurry => info!("second stop request, leaving the remaining rooms"),
+        }
+        self.shutdown().await;
     }
 
     /// Leaves every room now and waits until their Gladia sessions are deleted.
@@ -213,6 +263,10 @@ impl Agent {
     /// [`JoinError::Full`] at the room cap; [`JoinError::JoinFailed`] when the room does not
     /// exist or LiveKit refuses or does not answer within [`JOIN_TIMEOUT`].
     pub async fn join(self: &Arc<Self>, room: &str) -> Result<(), JoinError> {
+        if self.draining.load(Ordering::SeqCst) {
+            info!(room, "draining, not joining");
+            return Err(JoinError::Draining);
+        }
         let state = {
             let mut rooms = self.rooms.lock().await;
             if let Some(state) = rooms.get(room) {
@@ -339,24 +393,49 @@ impl Agent {
         Ok(listed.rooms.iter().any(|r| r.name == room))
     }
 
-    /// Captions `room` until the last person leaves, the room ends or the agent stops.
-    async fn stay(
+    /// Captions `room` until the last person leaves, the room ends or the agent stops, coming
+    /// back after a LiveKit outage as long as the room exists.
+    async fn stay(&self, room_name: &str, room: Room, events: mpsc::UnboundedReceiver<RoomEvent>) {
+        let mut leave = self.leave.subscribe();
+        let mut connection = Some((room, events));
+        while let Some((room, events)) = connection.take() {
+            if self.caption(room_name, room, events, &mut leave).await == Ended::Dropped {
+                connection = self.reconnect(room_name, &mut leave).await;
+            }
+        }
+    }
+
+    /// Runs one LiveKit connection to `room` until it ends.
+    async fn caption(
         &self,
         room_name: &str,
         room: Room,
         mut events: mpsc::UnboundedReceiver<RoomEvent>,
-    ) {
+        leave: &mut watch::Receiver<bool>,
+    ) -> Ended {
         let room = Arc::new(room);
         info!(room = room_name, "agent joined");
 
         let mut speakers: HashMap<ParticipantIdentity, Speaker> = HashMap::new();
-        let mut leave = self.leave.subscribe();
-        loop {
+        // Set while nobody else is in the room: the agent leaves when it expires.
+        let mut alone_until = alone_deadline(&room);
+        let ended = loop {
             let event = tokio::select! {
                 event = events.recv() => event,
-                _ = leave.wait_for(|leave| *leave) => None,
+                _ = leave.wait_for(|leave| *leave) => break Ended::Finished,
+                () = sleep_until_or_forever(alone_until) => {
+                    alone_until = None;
+                    // While the SDK reconnects, nobody shows: `Reconnected` checks again.
+                    if room.connection_state() != ConnectionState::Connected {
+                        continue;
+                    }
+                    info!(room = room_name, "nobody else in the room, leaving");
+                    break Ended::Finished;
+                }
             };
-            let Some(event) = event else { break };
+            let Some(event) = event else {
+                break Ended::Dropped;
+            };
             match event {
                 RoomEvent::TrackSubscribed {
                     track: RemoteTrack::Audio(track),
@@ -388,24 +467,91 @@ impl Agent {
                         old.pump.abort();
                     }
                 }
+                RoomEvent::ParticipantConnected(_) => alone_until = None,
                 RoomEvent::ParticipantDisconnected(participant) => {
                     if let Some(old) = speakers.remove(&participant.identity()) {
                         old.pump.abort();
                     }
+                    // While the SDK reconnects it drops every participant; people coming back
+                    // then reappear, so only a departure on a live connection ends the call.
                     if room.remote_participants().is_empty() {
-                        break;
+                        if room.connection_state() == ConnectionState::Connected {
+                            break Ended::Finished;
+                        }
+                        alone_until = alone_deadline(&room);
                     }
                 }
-                RoomEvent::Disconnected { .. } => break,
+                RoomEvent::Reconnecting => info!(
+                    room = room_name,
+                    "LiveKit connection lost, the SDK is resuming it"
+                ),
+                RoomEvent::Reconnected => {
+                    info!(room = room_name, "LiveKit connection resumed");
+                    // A full reconnection recreates the room if it was gone: nobody may come.
+                    alone_until = alone_deadline(&room);
+                }
+                RoomEvent::Disconnected { reason } => {
+                    break if ends_the_room(reason) {
+                        Ended::Finished
+                    } else {
+                        info!(room = room_name, reason = ?reason, "disconnected from LiveKit");
+                        Ended::Dropped
+                    };
+                }
                 _ => {}
             }
-        }
+        };
 
         for speaker in speakers.into_values() {
             speaker.pump.abort();
         }
         room.close().await.ok();
         info!(room = room_name, "agent left");
+        ended
+    }
+
+    /// Connects to `room` again after an outage, with a growing, bounded delay, while it exists.
+    ///
+    /// Each call starts counting attempts from zero, so a recovered connection gets the full
+    /// budget at its next outage.
+    async fn reconnect(
+        &self,
+        room: &str,
+        leave: &mut watch::Receiver<bool>,
+    ) -> Option<(Room, mpsc::UnboundedReceiver<RoomEvent>)> {
+        let mut missing = 0;
+        for attempt in 1..=RECONNECT_ATTEMPTS {
+            tokio::select! {
+                () = tokio::time::sleep(reconnect_delay(attempt)) => {}
+                _ = leave.wait_for(|leave| *leave) => return None,
+            }
+            match self.room_exists(room).await {
+                Ok(true) => {
+                    missing = 0;
+                    match tokio::time::timeout(JOIN_TIMEOUT, self.connect(room)).await {
+                        Ok(Ok(connection)) => {
+                            info!(room, attempt, "back in the room");
+                            return Some(connection);
+                        }
+                        Ok(Err(_)) | Err(_) => info!(room, attempt, "reconnection failed"),
+                    }
+                }
+                Ok(false) => {
+                    missing += 1;
+                    if missing >= ROOM_GONE_CHECKS {
+                        info!(room, "the room is gone, not reconnecting");
+                        return None;
+                    }
+                }
+                Err(_) => info!(room, attempt, "LiveKit unreachable, retrying"),
+            }
+        }
+        info!(
+            room,
+            attempts = RECONNECT_ATTEMPTS,
+            "LiveKit still unreachable, giving up on the room"
+        );
+        None
     }
 
     async fn start_speaker(
@@ -555,6 +701,37 @@ async fn publish_captions(
     }
 }
 
+/// Disconnections after which there is no room to come back to.
+fn ends_the_room(reason: livekit::DisconnectReason) -> bool {
+    matches!(
+        reason,
+        livekit::DisconnectReason::ClientInitiated
+            | livekit::DisconnectReason::DuplicateIdentity
+            | livekit::DisconnectReason::ParticipantRemoved
+            | livekit::DisconnectReason::RoomDeleted
+            | livekit::DisconnectReason::RoomClosed
+    )
+}
+
+/// 1, 2, 4, 8 then 15 s between reconnection attempts.
+fn reconnect_delay(attempt: u32) -> Duration {
+    let secs = 1u64 << attempt.saturating_sub(1).min(4);
+    Duration::from_secs(secs.min(15))
+}
+
+fn alone_deadline(room: &Room) -> Option<tokio::time::Instant> {
+    room.remote_participants()
+        .is_empty()
+        .then(|| tokio::time::Instant::now() + ALONE_TIMEOUT)
+}
+
+async fn sleep_until_or_forever(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
 /// HTTP base of LiveKit's server API, from the signalling URL (`wss://` becomes `https://`).
 fn http_base(url: &str) -> String {
     let url = url.trim_end_matches('/');
@@ -592,7 +769,16 @@ fn to_payload<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::{http_base, to_payload};
+    use std::time::Duration;
+
+    use super::{http_base, reconnect_delay, to_payload};
+
+    #[test]
+    fn reconnection_delays_grow_and_stay_bounded() {
+        let delays: Vec<u64> = (1..=7).map(|a| reconnect_delay(a).as_secs()).collect();
+        assert_eq!(delays, [1, 2, 4, 8, 15, 15, 15]);
+        assert_eq!(reconnect_delay(u32::MAX), Duration::from_secs(15));
+    }
 
     #[test]
     fn the_server_api_lives_on_the_http_side_of_the_signalling_url() {

@@ -31,7 +31,12 @@ Early, working prototype. Tested end to end against a local `livekit-server --de
    - on topic `livecap.self`, to the speaker only: their own live transcript (partials and finals);
    - on topic `livecap.captions`, to everyone else: the translation (or the final transcript when not translating).
 5. When a speaker leaves (or their track ends, the room empties, the agent stops, or Gladia fails the session), the agent closes their Gladia session and deletes it (`DELETE /v2/live/{id}`), so Gladia keeps neither the audio nor the transcript. A refused deletion is retried with a doubling delay for about 15 seconds; only the session id is logged.
-6. It leaves when the last participant does.
+6. It leaves when the last participant does, or after 20 seconds alone in a room.
+
+### Stopping and outages
+
+- On **SIGTERM** (or Ctrl-C) the agent drains: `join` answers `503 {"error":"draining"}`, `/health` reports `"status":"draining"`, and the calls in progress go on until they end or `LIVECAP_DRAIN_TIMEOUT_SECS` (2 hours by default) runs out. It then leaves the remaining rooms, deletes their Gladia sessions and exits with status 0. A second signal skips the wait. Give the service manager a longer stop timeout than the drain (see [docs/deploy.md](docs/deploy.md)).
+- When the connection to LiveKit drops, the LiveKit SDK resumes it for about 45 seconds; past that the agent reconnects to the room itself, with a growing delay (1, 2, 4, 8 then 15 seconds, ten attempts), as long as the room exists. Each outage starts counting from zero. A room found gone three times in a row, or a room nobody comes back to within 20 seconds, is given up without logging errors.
 
 Short utterances that speech models typically invent on silence ("Thank you.", "Merci.", "T-Series"…) are flagged `suspect` and never sent to listeners.
 
@@ -82,6 +87,7 @@ cargo run --release -- join my-room     # or join one room and exit when it empt
 | `GLADIA_SPEECH_THRESHOLD` | `0.75` | 0 to 1; higher ignores more background noise |
 | `LIVECAP_JOIN_SECRET` | none | bearer secret for `POST /rooms/{room}/join`; without it only webhooks work |
 | `LIVECAP_MAX_ROOMS` | `15` | rooms followed at once; beyond, `join` answers `503 full`. Each speaker holds one Gladia session: 15 two-person rooms stay under the 30 concurrent sessions of a paid Gladia account |
+| `LIVECAP_DRAIN_TIMEOUT_SECS` | `7200` | after SIGTERM, how long calls in progress may go on before the agent leaves them |
 | `LIVECAP_LISTEN_ADDR` | `0.0.0.0:8790` | HTTP address |
 | `LIVECAP_AGENT_IDENTITY` | `livecap` | identity of the hidden participant |
 | `LIVECAP_LANG_ATTRIBUTE`, `LIVECAP_TARGET_ATTRIBUTE` | `livecap.lang`, `livecap.target` | attribute names |
@@ -93,6 +99,7 @@ cargo run --release -- join my-room     # or join one room and exit when it empt
   - `200 {"status":"joined"}` when the agent is in the room (a room already followed answers 200 too, without a second agent);
   - `503 {"error":"full"}` when `LIVECAP_MAX_ROOMS` rooms are already followed;
   - `503 {"error":"join-failed"}` when the room does not exist (the agent never creates one), or LiveKit refused or did not answer in time;
+  - `503 {"error":"draining"}` once the agent is stopping;
   - `401` without the right secret, `400` for a room name outside `[A-Za-z0-9._-]{1,128}`, `404` when no secret is configured.
 - `GET /health` answers `200` with the version and the load, never a room name:
 
@@ -100,6 +107,7 @@ cargo run --release -- join my-room     # or join one room and exit when it empt
   { "status": "ok", "version": "0.2.0", "rooms": 1, "sessions": 2, "maxRooms": 15 }
   ```
 
+  `status` is `draining` once the agent is stopping.
   `sessions` counts the Gladia sessions opened and not yet deleted.
 - `POST /webhook` takes LiveKit webhooks (below).
 

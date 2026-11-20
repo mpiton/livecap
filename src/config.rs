@@ -1,6 +1,7 @@
 //! Configuration read from environment variables.
 
 use std::env;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 
@@ -9,6 +10,10 @@ use anyhow::{Context, Result};
 pub const DEFAULT_LANG_ATTRIBUTE: &str = "livecap.lang";
 /// Participant attribute holding the language this participant wants to read captions in.
 pub const DEFAULT_TARGET_ATTRIBUTE: &str = "livecap.target";
+
+/// Default limit on the calls still running after SIGTERM: two hours, the longest call expected.
+/// The service manager's stop timeout must be longer (see `docs/deploy.md`).
+pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2 * 3600);
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -28,6 +33,8 @@ pub struct Config {
     /// Rooms followed at once; `join` answers `full` beyond. Each room holds one Gladia session per
     /// speaker, so 15 two-person rooms stay under the 30 concurrent sessions of a paid account.
     pub max_rooms: usize,
+    /// After SIGTERM, how long the current calls may go on before the agent leaves them.
+    pub drain_timeout: Duration,
     /// Gladia speech threshold (0..1). Higher = fewer captions invented from silence.
     pub speech_threshold: f32,
 }
@@ -58,6 +65,13 @@ impl Config {
                     .filter(|n| *n > 0)
                     .context("LIVECAP_MAX_ROOMS must be a positive integer")?,
                 None => 15,
+            },
+            drain_timeout: match optional("LIVECAP_DRAIN_TIMEOUT_SECS") {
+                Some(v) => Duration::from_secs(
+                    v.parse()
+                        .context("LIVECAP_DRAIN_TIMEOUT_SECS must be a number of seconds")?,
+                ),
+                None => DEFAULT_DRAIN_TIMEOUT,
             },
             speech_threshold: match optional("GLADIA_SPEECH_THRESHOLD") {
                 Some(v) => v

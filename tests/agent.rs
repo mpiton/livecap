@@ -437,3 +437,190 @@ async fn health_counts_rooms_and_sessions_without_naming_rooms() {
     listener.leave().await;
     wait_until(WAIT, || async { agent.health().await["rooms"] == 0 }).await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sigterm_refuses_new_rooms_and_lets_the_current_call_finish() {
+    let Some(bin) = require_livekit("sigterm_refuses_new_rooms_and_lets_the_current_call_finish")
+    else {
+        return;
+    };
+    let _serial = common::LIVEKIT_LOCK.lock().await;
+    let livekit = LiveKitServer::start(bin).await;
+    let gladia = FakeGladia::start().await;
+    let mut agent = AgentProcess::start(&livekit.url(), &gladia.url(), &[]).await;
+    let (speaker, mut listener) =
+        call(&livekit, &agent, "ongoing", &[("livecap.lang", "en")]).await;
+    assert!(listener.next(WAIT).await.is_some(), "no caption arrived");
+    let other = Listener::join(&livekit.url(), "newcomer", "listener", CAPTIONS).await;
+
+    agent.sigterm();
+    wait_until(WAIT, || async {
+        agent.health().await["status"] == "draining"
+    })
+    .await;
+    let (status, body) = agent.join("newcomer").await;
+    assert_eq!(status, 503);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!({ "error": "draining" })
+    );
+    // The call goes on: captions keep coming, nothing is deleted, the agent is still there.
+    listener.clear();
+    assert!(
+        listener.next(WAIT).await.is_some(),
+        "captions stopped while draining"
+    );
+    assert!(gladia.calls().deleted.is_empty());
+    assert!(agent.wait_exit(Duration::from_secs(2)).await.is_none());
+
+    speaker.leave().await;
+    listener.leave().await;
+    let status = agent
+        .wait_exit(WAIT)
+        .await
+        .expect("the agent did not exit after the call");
+    assert!(status.success(), "exit status {status}");
+    assert_eq!(gladia.calls().deleted, ["session-1"]);
+    other.leave().await;
+}
+
+/// Kills the LiveKit server for `length`, starts it again, and brings the two people back.
+async fn outage(
+    livekit: &mut LiveKitServer,
+    speaker: Speaker,
+    listener: Listener,
+    room: &str,
+    length: Duration,
+) -> (Speaker, Listener) {
+    livekit.kill().await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), speaker.leave()).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), listener.leave()).await;
+    tokio::time::sleep(length).await;
+    livekit.restart().await;
+    let listener = Listener::join(&livekit.url(), room, "listener", CAPTIONS).await;
+    let speaker = Speaker::join(&livekit.url(), room, "speaker", &[("livecap.lang", "en")]).await;
+    (speaker, listener)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_agent_comes_back_to_the_room_after_each_livekit_outage() {
+    let Some(bin) = require_livekit("the_agent_comes_back_to_the_room_after_each_livekit_outage")
+    else {
+        return;
+    };
+    let _serial = common::LIVEKIT_LOCK.lock().await;
+    let mut livekit = LiveKitServer::start(bin).await;
+    let gladia = FakeGladia::start().await;
+    let agent = AgentProcess::start(&livekit.url(), &gladia.url(), &[]).await;
+    let (mut speaker, mut listener) =
+        call(&livekit, &agent, "bumpy", &[("livecap.lang", "en")]).await;
+    assert!(listener.next(WAIT).await.is_some(), "no caption arrived");
+
+    // Two outages in a row: the second recovers as well as the first, so the retry count
+    // started again from zero after the first recovery.
+    for round in 1..=2 {
+        (speaker, listener) = outage(
+            &mut livekit,
+            speaker,
+            listener,
+            "bumpy",
+            Duration::from_secs(2),
+        )
+        .await;
+        let caption = listener.next(Duration::from_secs(60)).await;
+        assert!(
+            caption.is_some(),
+            "no caption after outage {round}:\n{}",
+            agent.logs()
+        );
+        assert_eq!(agent.health().await["rooms"], 1);
+    }
+    speaker.leave().await;
+    listener.leave().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_room_gone_after_an_outage_stops_the_retries_without_errors() {
+    let Some(bin) = require_livekit("a_room_gone_after_an_outage_stops_the_retries") else {
+        return;
+    };
+    let _serial = common::LIVEKIT_LOCK.lock().await;
+    let mut livekit = LiveKitServer::start(bin).await;
+    let gladia = FakeGladia::start().await;
+    let agent = AgentProcess::start(&livekit.url(), &gladia.url(), &[]).await;
+    let (speaker, mut listener) =
+        call(&livekit, &agent, "vanished", &[("livecap.lang", "en")]).await;
+    assert!(listener.next(WAIT).await.is_some(), "no caption arrived");
+
+    livekit.kill().await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), speaker.leave()).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), listener.leave()).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    livekit.restart().await;
+
+    // Nobody comes back. The SDK's own reconnection may recreate the room with the agent alone
+    // in it (LiveKit then closes it after its empty timeout): the agent leaves it.
+    wait_until(Duration::from_secs(90), || async {
+        agent.health().await["rooms"] == 0
+    })
+    .await;
+    wait_until(WAIT, || async { gladia.calls().deleted == ["session-1"] }).await;
+    assert!(
+        !livekit
+            .participants("vanished")
+            .await
+            .contains(&"livecap".to_owned())
+    );
+    // The LiveKit SDK logs its own retries as errors; the agent logs none.
+    let logs = agent.logs();
+    let errors: Vec<&str> = logs
+        .lines()
+        .filter(|l| l.contains(" ERROR livecap"))
+        .collect();
+    assert!(errors.is_empty(), "errors logged:\n{}", errors.join("\n"));
+    let after = logs.len();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let quiet = agent.logs()[after..]
+        .lines()
+        .filter(|l| l.contains("livecap"))
+        .count();
+    assert_eq!(
+        quiet,
+        0,
+        "the agent keeps logging:\n{}",
+        &agent.logs()[after..]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_agent_reconnects_itself_after_an_outage_longer_than_the_sdk_retries() {
+    let Some(bin) = require_livekit("the_agent_reconnects_itself_after_a_long_outage") else {
+        return;
+    };
+    let _serial = common::LIVEKIT_LOCK.lock().await;
+    let mut livekit = LiveKitServer::start(bin).await;
+    let gladia = FakeGladia::start().await;
+    let agent = AgentProcess::start(&livekit.url(), &gladia.url(), &[]).await;
+    let (speaker, mut listener) = call(&livekit, &agent, "long", &[("livecap.lang", "en")]).await;
+    assert!(listener.next(WAIT).await.is_some(), "no caption arrived");
+
+    // The LiveKit SDK gives up after about 45 s of retries; the agent keeps the room and
+    // reconnects on its own once the server is back.
+    let (speaker, mut listener) = outage(
+        &mut livekit,
+        speaker,
+        listener,
+        "long",
+        Duration::from_secs(55),
+    )
+    .await;
+    let caption = listener.next(Duration::from_secs(60)).await;
+    let logs = agent.logs();
+    assert!(caption.is_some(), "no caption after the outage:\n{logs}");
+    assert!(
+        logs.contains("back in the room"),
+        "the agent did not reconnect itself:\n{logs}"
+    );
+    speaker.leave().await;
+    listener.leave().await;
+}

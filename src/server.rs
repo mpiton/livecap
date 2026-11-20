@@ -81,7 +81,7 @@ async fn join(
 async fn health(State(state): State<AppState>) -> Json<Value> {
     let load = state.agent.load().await;
     Json(json!({
-        "status": "ok",
+        "status": if load.draining { "draining" } else { "ok" },
         "version": env!("CARGO_PKG_VERSION"),
         "rooms": load.rooms,
         "sessions": load.sessions,
