@@ -92,6 +92,28 @@ The LiveKit Rust SDK links a prebuilt libwebrtc that needs **clang 21 or later**
 CC=clang-21 CXX=clang++-21 cargo build --release
 ```
 
+## Testing
+
+```bash
+cargo test
+```
+
+runs the unit tests and the integration tests under `tests/`. None of them calls Gladia or LiveKit Cloud:
+
+- `tests/common/fake_gladia.rs` is a fake Gladia live API (`POST /v2/live`, the session WebSocket, `DELETE /v2/live/{id}`, and `GET /calls` to replay what it received). It answers every session with captions written in advance; the agent is pointed at it with `GLADIA_API_URL`.
+- `tests/agent.rs` runs the `livecap` binary against that fake and a local `livekit-server` in dev mode, with test participants that publish a tone and read the captions. It also checks that no transcript or translation text reaches the agent's logs (captured at `RUST_LOG=debug`).
+
+The end-to-end tests need a `livekit-server` binary (1.13 or later) named by `LIVEKIT_SERVER_BIN`; without it they are **skipped** and print `SKIPPED <test>: set LIVEKIT_SERVER_BIN ...`. CI downloads a pinned release and checks its SHA-256. Locally:
+
+```bash
+curl -fsSLO https://github.com/livekit/livekit/releases/download/v1.13.11/livekit_1.13.11_linux_amd64.tar.gz
+echo "1e9ee90ca301e1842b2887fc77cb122759756a9c8aeb4334ee91de3325ec43fb  livekit_1.13.11_linux_amd64.tar.gz" | sha256sum -c
+tar xzf livekit_1.13.11_linux_amd64.tar.gz livekit-server
+LIVEKIT_SERVER_BIN=$PWD/livekit-server cargo test
+```
+
+Each test starts its own `livekit-server` and agent on ports the kernel hands out (the ephemeral range), so nothing needs to be free beforehand; the tests that use WebRTC run one at a time.
+
 ## Costs, for reference
 
 With Gladia's Starter plan (October 2026): €0.68 per hour of audio plus €0.05 per hour for translation, per speaker. The agent counts as one more LiveKit participant.
