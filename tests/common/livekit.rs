@@ -34,8 +34,15 @@ pub fn livekit_server_bin() -> Option<PathBuf> {
 }
 
 /// Returns the binary, or prints why the calling test is skipped.
+///
+/// On CI (`CI` set, as GitHub Actions does) a missing binary fails the test instead: the
+/// end-to-end tests must not pass there by skipping.
 pub fn require_livekit(test: &str) -> Option<PathBuf> {
     let bin = livekit_server_bin();
+    assert!(
+        bin.is_some() || std::env::var_os("CI").is_none(),
+        "{test}: LIVEKIT_SERVER_BIN must name a livekit-server binary on CI"
+    );
     if bin.is_none() {
         eprintln!(
             "SKIPPED {test}: set LIVEKIT_SERVER_BIN to a livekit-server binary to run this test"

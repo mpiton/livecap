@@ -132,7 +132,7 @@ runs the unit tests and the integration tests under `tests/`. None of them calls
 - `tests/common/fake_gladia.rs` is a fake Gladia live API (`POST /v2/live`, the session WebSocket, `DELETE /v2/live/{id}`, and `GET /calls` to replay what it received). It answers every session with captions written in advance; the agent is pointed at it with `GLADIA_API_URL`.
 - `tests/agent.rs` runs the `livecap` binary against that fake and a local `livekit-server` in dev mode, with test participants that publish a tone and read the captions. It also checks that no transcript or translation text reaches the agent's logs (captured at `RUST_LOG=debug,livekit=info,livekit_api=info,libwebrtc=info`: at `debug` the LiveKit SDK itself prints whole signalling messages, see [Logs](docs/deploy.md#logs)).
 
-The end-to-end tests need a `livekit-server` binary (1.13 or later) named by `LIVEKIT_SERVER_BIN`; without it they are **skipped** and print `SKIPPED <test>: set LIVEKIT_SERVER_BIN ...`. CI downloads a pinned release and checks its SHA-256. Locally:
+The end-to-end tests need a `livekit-server` binary (1.13 or later) named by `LIVEKIT_SERVER_BIN`; without it they are **skipped** and print `SKIPPED <test>: set LIVEKIT_SERVER_BIN ...`, except on CI (`CI` set), where a missing binary fails them. CI downloads a pinned release and checks its SHA-256. Locally:
 
 ```bash
 curl -fsSLO https://github.com/livekit/livekit/releases/download/v1.13.11/livekit_1.13.11_linux_amd64.tar.gz
