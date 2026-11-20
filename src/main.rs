@@ -3,18 +3,11 @@
 //! `livecap serve` waits for LiveKit webhooks (or `POST /rooms/{room}/join`) and joins
 //! rooms as a hidden participant. `livecap join <room>` joins one room and exits when it empties.
 
-mod audio;
-mod config;
-mod filter;
-mod gladia;
-mod room;
-mod server;
-
 use anyhow::{Context, Result, bail};
+use livecap::config::Config;
+use livecap::room::Agent;
+use livecap::server;
 use tracing_subscriber::EnvFilter;
-
-use crate::config::Config;
-use crate::room::Agent;
 
 #[tokio::main]
 async fn main() -> Result<()> {
