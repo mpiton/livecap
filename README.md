@@ -81,10 +81,27 @@ cargo run --release -- join my-room     # or join one room and exit when it empt
 | `GLADIA_REGION` | `eu-west` | Gladia region that processes the audio (`eu-west` or `us-west`), sent on every session opening |
 | `GLADIA_SPEECH_THRESHOLD` | `0.75` | 0 to 1; higher ignores more background noise |
 | `LIVECAP_JOIN_SECRET` | none | bearer secret for `POST /rooms/{room}/join`; without it only webhooks work |
+| `LIVECAP_MAX_ROOMS` | `15` | rooms followed at once; beyond, `join` answers `503 full`. Each speaker holds one Gladia session: 15 two-person rooms stay under the 30 concurrent sessions of a paid Gladia account |
 | `LIVECAP_LISTEN_ADDR` | `0.0.0.0:8790` | HTTP address |
 | `LIVECAP_AGENT_IDENTITY` | `livecap` | identity of the hidden participant |
 | `LIVECAP_LANG_ATTRIBUTE`, `LIVECAP_TARGET_ATTRIBUTE` | `livecap.lang`, `livecap.target` | attribute names |
 | `RUST_LOG` | `info` | log filter |
+
+### HTTP API
+
+- `POST /rooms/{room}/join` with `Authorization: Bearer $LIVECAP_JOIN_SECRET` answers once it has tried, within about 10 seconds:
+  - `200 {"status":"joined"}` when the agent is in the room (a room already followed answers 200 too, without a second agent);
+  - `503 {"error":"full"}` when `LIVECAP_MAX_ROOMS` rooms are already followed;
+  - `503 {"error":"join-failed"}` when the room does not exist (the agent never creates one), or LiveKit refused or did not answer in time;
+  - `401` without the right secret, `400` for a room name outside `[A-Za-z0-9._-]{1,128}`, `404` when no secret is configured.
+- `GET /health` answers `200` with the version and the load, never a room name:
+
+  ```json
+  { "status": "ok", "version": "0.2.0", "rooms": 1, "sessions": 2, "maxRooms": 15 }
+  ```
+
+  `sessions` counts the Gladia sessions opened and not yet deleted.
+- `POST /webhook` takes LiveKit webhooks (below).
 
 To use webhooks, point your LiveKit project's webhook URL at `https://<agent>/webhook`; requests are verified with the API key and secret.
 

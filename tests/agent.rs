@@ -24,10 +24,7 @@ async fn call(
     let listener = Listener::join(&livekit.url(), room, "listener", CAPTIONS).await;
     let speaker = Speaker::join(&livekit.url(), room, "speaker", attributes).await;
     let (status, body) = agent.join(room).await;
-    assert!(
-        (200..300).contains(&status),
-        "join answered {status} {body}"
-    );
+    assert_eq!(status, 200, "join answered {status} {body}");
     (speaker, listener)
 }
 
@@ -261,4 +258,182 @@ async fn stopping_the_agent_deletes_the_sessions_still_open() {
     assert_eq!(gladia.calls().deleted, ["session-1"]);
     speaker.leave().await;
     listener.leave().await;
+}
+
+/// The agent pointed at an address where no LiveKit server listens.
+async fn agent_without_livekit(extra: &[(&str, &str)]) -> (FakeGladia, AgentProcess) {
+    let gladia = FakeGladia::start().await;
+    let nowhere = format!("ws://127.0.0.1:{}", common::livekit::free_tcp_port());
+    let agent = AgentProcess::start(&nowhere, &gladia.url(), extra).await;
+    (gladia, agent)
+}
+
+#[tokio::test]
+async fn join_refuses_a_missing_or_wrong_secret_and_a_bad_room_name() {
+    let (_gladia, agent) = agent_without_livekit(&[]).await;
+    let client = reqwest::Client::new();
+    let url = format!("{}/rooms/room-1/join", agent.base_url);
+    let none = client.post(&url).send().await.unwrap();
+    assert_eq!(none.status(), 401);
+    let wrong = client.post(&url).bearer_auth("nope").send().await.unwrap();
+    assert_eq!(wrong.status(), 401);
+    let (status, _) = agent.join("bad%20name").await;
+    assert_eq!(status, 400);
+}
+
+#[tokio::test]
+async fn join_answers_503_join_failed_when_livekit_is_unreachable() {
+    let (_gladia, agent) = agent_without_livekit(&[]).await;
+    let (status, body) = agent.join("room-1").await;
+    assert_eq!(status, 503);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!({ "error": "join-failed" })
+    );
+    assert_eq!(agent.health().await["rooms"], 0);
+}
+
+#[tokio::test]
+async fn health_reports_version_load_and_cap_as_json() {
+    let (_gladia, agent) = agent_without_livekit(&[("LIVECAP_MAX_ROOMS", "4")]).await;
+    assert_eq!(
+        agent.health().await,
+        serde_json::json!({
+            "status": "ok",
+            "version": env!("CARGO_PKG_VERSION"),
+            "rooms": 0,
+            "sessions": 0,
+            "maxRooms": 4
+        })
+    );
+    let (_gladia, agent) = agent_without_livekit(&[]).await;
+    assert_eq!(agent.health().await["maxRooms"], 15);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn join_answers_200_once_the_agent_is_in_the_room() {
+    let Some(bin) = require_livekit("join_answers_200_once_the_agent_is_in_the_room") else {
+        return;
+    };
+    let _serial = common::LIVEKIT_LOCK.lock().await;
+    let livekit = LiveKitServer::start(bin).await;
+    let gladia = FakeGladia::start().await;
+    let agent = AgentProcess::start(&livekit.url(), &gladia.url(), &[]).await;
+    let listener = Listener::join(&livekit.url(), "entered", "listener", CAPTIONS).await;
+
+    let (status, body) = agent.join("entered").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!({ "status": "joined" })
+    );
+    // No waiting: the agent is in the room when join answers.
+    assert!(
+        livekit
+            .participants("entered")
+            .await
+            .contains(&"livecap".to_owned())
+    );
+    listener.leave().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_join_on_a_followed_room_answers_200_without_a_duplicate() {
+    let Some(bin) = require_livekit("a_second_join_on_a_followed_room_answers_200") else {
+        return;
+    };
+    let _serial = common::LIVEKIT_LOCK.lock().await;
+    let livekit = LiveKitServer::start(bin).await;
+    let gladia = FakeGladia::start().await;
+    let agent = AgentProcess::start(&livekit.url(), &gladia.url(), &[]).await;
+    let listener = Listener::join(&livekit.url(), "twice", "listener", CAPTIONS).await;
+
+    let (first, second) = tokio::join!(agent.join("twice"), agent.join("twice"));
+    assert_eq!((first.0, second.0), (200, 200));
+    assert_eq!(agent.join("twice").await.0, 200);
+    let agents = livekit
+        .participants("twice")
+        .await
+        .into_iter()
+        .filter(|p| p == "livecap")
+        .count();
+    assert_eq!(agents, 1);
+    assert_eq!(agent.health().await["rooms"], 1);
+    listener.leave().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn join_answers_503_full_beyond_the_room_cap() {
+    let Some(bin) = require_livekit("join_answers_503_full_beyond_the_room_cap") else {
+        return;
+    };
+    let _serial = common::LIVEKIT_LOCK.lock().await;
+    let livekit = LiveKitServer::start(bin).await;
+    let gladia = FakeGladia::start().await;
+    let agent =
+        AgentProcess::start(&livekit.url(), &gladia.url(), &[("LIVECAP_MAX_ROOMS", "1")]).await;
+    let first = Listener::join(&livekit.url(), "first", "listener", CAPTIONS).await;
+    let second = Listener::join(&livekit.url(), "second", "listener", CAPTIONS).await;
+
+    assert_eq!(agent.join("first").await.0, 200);
+    let (status, body) = agent.join("second").await;
+    assert_eq!(status, 503);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!({ "error": "full" })
+    );
+    assert!(
+        !livekit
+            .participants("second")
+            .await
+            .contains(&"livecap".to_owned())
+    );
+    first.leave().await;
+    second.leave().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn join_answers_503_for_a_room_that_does_not_exist_without_creating_it() {
+    let Some(bin) = require_livekit("join_answers_503_for_a_room_that_does_not_exist") else {
+        return;
+    };
+    let _serial = common::LIVEKIT_LOCK.lock().await;
+    let livekit = LiveKitServer::start(bin).await;
+    let gladia = FakeGladia::start().await;
+    let agent = AgentProcess::start(&livekit.url(), &gladia.url(), &[]).await;
+
+    let (status, body) = agent.join("ghost").await;
+    assert_eq!(status, 503);
+    assert!(body.contains("join-failed"), "{body}");
+    assert!(!livekit.room_names().await.contains(&"ghost".to_owned()));
+    assert_eq!(agent.health().await["rooms"], 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn health_counts_rooms_and_sessions_without_naming_rooms() {
+    let Some(bin) = require_livekit("health_counts_rooms_and_sessions_without_naming_rooms") else {
+        return;
+    };
+    let _serial = common::LIVEKIT_LOCK.lock().await;
+    let livekit = LiveKitServer::start(bin).await;
+    let gladia = FakeGladia::start().await;
+    let agent = AgentProcess::start(&livekit.url(), &gladia.url(), &[]).await;
+
+    let (speaker, mut listener) = call(
+        &livekit,
+        &agent,
+        "secret-room-name",
+        &[("livecap.lang", "en")],
+    )
+    .await;
+    assert!(listener.next(WAIT).await.is_some(), "no caption arrived");
+    let health = agent.health().await;
+    assert_eq!(health["rooms"], 1);
+    assert_eq!(health["sessions"], 1);
+    assert!(!health.to_string().contains("secret-room-name"));
+
+    speaker.leave().await;
+    wait_until(WAIT, || async { agent.health().await["sessions"] == 0 }).await;
+    listener.leave().await;
+    wait_until(WAIT, || async { agent.health().await["rooms"] == 0 }).await;
 }

@@ -10,7 +10,7 @@ use futures::StreamExt;
 use livekit::prelude::*;
 use livekit::webrtc::audio_stream::native::NativeAudioStream;
 use livekit_api::access_token::{AccessToken, VideoGrants};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Notify, mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
@@ -28,6 +28,12 @@ pub const TOPIC_SELF: &str = "livecap.self";
 /// Audio chunks buffered per speaker before older ones are dropped (about 4 s).
 const AUDIO_BUFFER: usize = 100;
 
+/// How long `join` waits for LiveKit before answering `join-failed`. Callers wait for the answer
+/// before telling people whether captions will come, so this stays short.
+pub const JOIN_TIMEOUT: Duration = Duration::from_secs(10);
+/// Timeout of one call to LiveKit's server API.
+const LIVEKIT_API_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// How long [`Agent::shutdown`] waits for the open Gladia sessions to be deleted. Covers the
 /// last results (3 s) and the deletion retries (about 15 s).
 const SESSIONS_DELETION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -35,10 +41,54 @@ const SESSIONS_DELETION_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct Agent {
     config: Config,
     gladia: GladiaClient,
-    active_rooms: Mutex<HashSet<String>>,
+    http: reqwest::Client,
+    /// Rooms followed or being joined, with the state of their join.
+    rooms: Mutex<HashMap<String, watch::Receiver<RoomState>>>,
+    rooms_changed: Notify,
     sessions: Arc<Gauge>,
     /// Set to `true` to make every room leave now.
     leave: watch::Sender<bool>,
+}
+
+/// Why the agent did not join a room; [`JoinError::reason`] is the short code `join` answers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JoinError {
+    /// `LIVECAP_MAX_ROOMS` rooms are already followed.
+    Full,
+    /// The room does not exist, or LiveKit refused or did not answer in time.
+    JoinFailed,
+}
+
+impl JoinError {
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::JoinFailed => "join-failed",
+        }
+    }
+}
+
+impl std::fmt::Display for JoinError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.reason())
+    }
+}
+
+impl std::error::Error for JoinError {}
+
+/// Load reported by `/health`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Load {
+    pub rooms: usize,
+    pub sessions: usize,
+    pub max_rooms: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RoomState {
+    Connecting,
+    Joined,
+    Failed,
 }
 
 /// A count that can be awaited until it drops to zero.
@@ -108,15 +158,35 @@ impl Agent {
         Arc::new(Self {
             config,
             gladia,
-            active_rooms: Mutex::new(HashSet::new()),
+            http: reqwest::Client::new(),
+            rooms: Mutex::new(HashMap::new()),
+            rooms_changed: Notify::new(),
             sessions: Arc::new(Gauge::default()),
             leave: watch::channel(false).0,
         })
     }
 
-    /// Gladia sessions opened and not yet deleted.
-    pub fn open_sessions(&self) -> usize {
-        self.sessions.get()
+    pub fn identity(&self) -> &str {
+        &self.config.agent_identity
+    }
+
+    pub async fn load(&self) -> Load {
+        Load {
+            rooms: self.rooms.lock().await.len(),
+            sessions: self.sessions.get(),
+            max_rooms: self.config.max_rooms,
+        }
+    }
+
+    /// Waits until the agent follows no room.
+    pub async fn idle(&self) {
+        loop {
+            let changed = self.rooms_changed.notified();
+            if self.rooms.lock().await.is_empty() {
+                return;
+            }
+            changed.await;
+        }
     }
 
     /// Leaves every room now and waits until their Gladia sessions are deleted.
@@ -133,26 +203,75 @@ impl Agent {
         }
     }
 
-    pub fn identity(&self) -> &str {
-        &self.config.agent_identity
-    }
-
-    /// Starts captioning `room` in the background; does nothing if the agent is already there.
-    pub async fn join(self: &Arc<Self>, room: String) {
-        if !self.active_rooms.lock().await.insert(room.clone()) {
-            return;
-        }
-        let agent = Arc::clone(self);
-        tokio::spawn(async move {
-            if let Err(err) = agent.run(&room).await {
-                warn!(%room, error = %format!("{err:#}"), "agent stopped");
+    /// Enters `room` and captions it in the background until the last person leaves.
+    ///
+    /// Returns once the agent is in the room. A room already followed (or being joined) is not
+    /// joined twice: the call waits for that join and shares its outcome.
+    ///
+    /// # Errors
+    ///
+    /// [`JoinError::Full`] at the room cap; [`JoinError::JoinFailed`] when the room does not
+    /// exist or LiveKit refuses or does not answer within [`JOIN_TIMEOUT`].
+    pub async fn join(self: &Arc<Self>, room: &str) -> Result<(), JoinError> {
+        let state = {
+            let mut rooms = self.rooms.lock().await;
+            if let Some(state) = rooms.get(room) {
+                let mut state = state.clone();
+                drop(rooms);
+                return match state.wait_for(|s| *s != RoomState::Connecting).await {
+                    Ok(s) if *s == RoomState::Joined => Ok(()),
+                    _ => Err(JoinError::JoinFailed),
+                };
             }
-            agent.active_rooms.lock().await.remove(&room);
-        });
+            if rooms.len() >= self.config.max_rooms {
+                warn!(
+                    room,
+                    max_rooms = self.config.max_rooms,
+                    "room cap reached, not joining"
+                );
+                return Err(JoinError::Full);
+            }
+            let (state, receiver) = watch::channel(RoomState::Connecting);
+            rooms.insert(room.to_owned(), receiver);
+            state
+        };
+
+        let connected = match tokio::time::timeout(JOIN_TIMEOUT, self.connect(room)).await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!("no answer within {JOIN_TIMEOUT:?}")),
+        };
+        match connected {
+            Ok((lk_room, events)) => {
+                state.send_replace(RoomState::Joined);
+                let agent = Arc::clone(self);
+                let room = room.to_owned();
+                tokio::spawn(async move {
+                    agent.stay(&room, lk_room, events).await;
+                    agent.forget(&room).await;
+                    drop(state);
+                });
+                Ok(())
+            }
+            Err(err) => {
+                warn!(room, error = %format!("{err:#}"), "cannot join the room");
+                state.send_replace(RoomState::Failed);
+                self.forget(room).await;
+                Err(JoinError::JoinFailed)
+            }
+        }
     }
 
-    /// Stays in the room until the last person leaves.
-    pub async fn run(&self, room_name: &str) -> Result<()> {
+    async fn forget(&self, room: &str) {
+        self.rooms.lock().await.remove(room);
+        self.rooms_changed.notify_waiters();
+    }
+
+    /// Connects to an existing room. LiveKit creates missing rooms on join, so existence is
+    /// checked first: the agent must not open a room nobody is in.
+    async fn connect(&self, room: &str) -> Result<(Room, mpsc::UnboundedReceiver<RoomEvent>)> {
+        if !self.room_exists(room).await? {
+            anyhow::bail!("the room does not exist");
+        }
         let token = AccessToken::with_api_key(
             &self.config.livekit_api_key,
             &self.config.livekit_api_secret,
@@ -162,7 +281,7 @@ impl Agent {
         .with_ttl(Duration::from_secs(6 * 3600))
         .with_grants(VideoGrants {
             room_join: true,
-            room: room_name.to_owned(),
+            room: room.to_owned(),
             can_publish: Some(false),
             can_subscribe: Some(true),
             can_publish_data: Some(true),
@@ -172,11 +291,61 @@ impl Agent {
         })
         .to_jwt()
         .context("cannot sign the agent token")?;
+        Room::connect(&self.config.livekit_url, &token, RoomOptions::default())
+            .await
+            .context("cannot join the LiveKit room")
+    }
 
-        let (room, mut events) =
-            Room::connect(&self.config.livekit_url, &token, RoomOptions::default())
-                .await
-                .context("cannot join the LiveKit room")?;
+    /// Asks LiveKit's `RoomService.ListRooms` (Twirp, JSON) whether `room` exists.
+    async fn room_exists(&self, room: &str) -> Result<bool> {
+        #[derive(Deserialize)]
+        struct Listed {
+            #[serde(default)]
+            rooms: Vec<Named>,
+        }
+        #[derive(Deserialize)]
+        struct Named {
+            #[serde(default)]
+            name: String,
+        }
+        let token = AccessToken::with_api_key(
+            &self.config.livekit_api_key,
+            &self.config.livekit_api_secret,
+        )
+        .with_ttl(Duration::from_secs(60))
+        .with_grants(VideoGrants {
+            room_list: true,
+            ..Default::default()
+        })
+        .to_jwt()
+        .context("cannot sign the API token")?;
+        let listed: Listed = self
+            .http
+            .post(format!(
+                "{}/twirp/livekit.RoomService/ListRooms",
+                http_base(&self.config.livekit_url)
+            ))
+            .bearer_auth(token)
+            .json(&serde_json::json!({ "names": [room] }))
+            .timeout(LIVEKIT_API_TIMEOUT)
+            .send()
+            .await
+            .context("LiveKit unreachable")?
+            .error_for_status()
+            .context("LiveKit refused to list rooms")?
+            .json()
+            .await
+            .context("unexpected LiveKit answer")?;
+        Ok(listed.rooms.iter().any(|r| r.name == room))
+    }
+
+    /// Captions `room` until the last person leaves, the room ends or the agent stops.
+    async fn stay(
+        &self,
+        room_name: &str,
+        room: Room,
+        mut events: mpsc::UnboundedReceiver<RoomEvent>,
+    ) {
         let room = Arc::new(room);
         info!(room = room_name, "agent joined");
 
@@ -237,7 +406,6 @@ impl Agent {
         }
         room.close().await.ok();
         info!(room = room_name, "agent left");
-        Ok(())
     }
 
     async fn start_speaker(
@@ -387,6 +555,18 @@ async fn publish_captions(
     }
 }
 
+/// HTTP base of LiveKit's server API, from the signalling URL (`wss://` becomes `https://`).
+fn http_base(url: &str) -> String {
+    let url = url.trim_end_matches('/');
+    if let Some(rest) = url.strip_prefix("wss://") {
+        format!("https://{rest}")
+    } else if let Some(rest) = url.strip_prefix("ws://") {
+        format!("http://{rest}")
+    } else {
+        url.to_owned()
+    }
+}
+
 fn to_payload<'a>(
     event: &'a CaptionEvent,
     speaker: &'a str,
@@ -412,7 +592,17 @@ fn to_payload<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::to_payload;
+    use super::{http_base, to_payload};
+
+    #[test]
+    fn the_server_api_lives_on_the_http_side_of_the_signalling_url() {
+        assert_eq!(
+            http_base("wss://x.livekit.cloud/"),
+            "https://x.livekit.cloud"
+        );
+        assert_eq!(http_base("ws://127.0.0.1:7880"), "http://127.0.0.1:7880");
+        assert_eq!(http_base("https://lk.example"), "https://lk.example");
+    }
     use crate::gladia::{CaptionEvent, CaptionKind};
 
     #[test]

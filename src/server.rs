@@ -2,12 +2,14 @@
 
 use std::sync::Arc;
 
-use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use axum::{Json, Router};
 use livekit_api::access_token::TokenVerifier;
 use livekit_api::webhooks::WebhookReceiver;
+use serde_json::{Value, json};
 use tracing::{info, warn};
 
 use crate::room::Agent;
@@ -31,7 +33,7 @@ pub fn router(
         join_secret,
     };
     Router::new()
-        .route("/health", get(|| async { "ok" }))
+        .route("/health", get(health))
         .route("/rooms/{room}/join", post(join))
         .route("/webhook", post(webhook))
         .with_state(state)
@@ -50,9 +52,9 @@ async fn join(
     State(state): State<AppState>,
     Path(room): Path<String>,
     headers: HeaderMap,
-) -> StatusCode {
+) -> Response {
     let Some(secret) = state.join_secret.as_deref() else {
-        return StatusCode::NOT_FOUND;
+        return StatusCode::NOT_FOUND.into_response();
     };
     let authorized = headers
         .get(header::AUTHORIZATION)
@@ -60,13 +62,31 @@ async fn join(
         .and_then(|v| v.strip_prefix("Bearer "))
         .is_some_and(|token| constant_time_eq(token.as_bytes(), secret.as_bytes()));
     if !authorized {
-        return StatusCode::UNAUTHORIZED;
+        return StatusCode::UNAUTHORIZED.into_response();
     }
     if !valid_room_name(&room) {
-        return StatusCode::BAD_REQUEST;
+        return StatusCode::BAD_REQUEST.into_response();
     }
-    state.agent.join(room).await;
-    StatusCode::ACCEPTED
+    match state.agent.join(&room).await {
+        Ok(()) => (StatusCode::OK, Json(json!({ "status": "joined" }))).into_response(),
+        Err(err) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": err.reason() })),
+        )
+            .into_response(),
+    }
+}
+
+/// Version and load, without room names.
+async fn health(State(state): State<AppState>) -> Json<Value> {
+    let load = state.agent.load().await;
+    Json(json!({
+        "status": "ok",
+        "version": env!("CARGO_PKG_VERSION"),
+        "rooms": load.rooms,
+        "sessions": load.sessions,
+        "maxRooms": load.max_rooms,
+    }))
 }
 
 async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String) -> StatusCode {
@@ -90,7 +110,9 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
         && let Some(room) = event.room.filter(|r| valid_room_name(&r.name))
     {
         info!(room = %room.name, "webhook: participant joined");
-        state.agent.join(room.name).await;
+        // The webhook answers at once; `join` logs its own failures.
+        let agent = Arc::clone(&state.agent);
+        tokio::spawn(async move { agent.join(&room.name).await });
     }
     StatusCode::OK
 }

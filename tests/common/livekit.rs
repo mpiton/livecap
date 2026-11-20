@@ -120,6 +120,49 @@ impl LiveKitServer {
         self.spawn().await;
     }
 
+    /// Identities of the participants in `room`, hidden ones included.
+    pub async fn participants(&self, room: &str) -> Vec<String> {
+        let body = self
+            .twirp(
+                "ListParticipants",
+                serde_json::json!({ "room": room }),
+                VideoGrants {
+                    room_admin: true,
+                    room: room.to_owned(),
+                    ..Default::default()
+                },
+            )
+            .await;
+        body["participants"]
+            .as_array()
+            .map(|list| {
+                list.iter()
+                    .filter_map(|p| p["identity"].as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    async fn twirp(&self, method: &str, body: Value, grants: VideoGrants) -> Value {
+        let token = AccessToken::with_api_key(API_KEY, API_SECRET)
+            .with_grants(grants)
+            .to_jwt()
+            .unwrap();
+        reqwest::Client::new()
+            .post(format!(
+                "http://127.0.0.1:{}/twirp/livekit.RoomService/{method}",
+                self.port
+            ))
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    }
+
     pub async fn room_names(&self) -> Vec<String> {
         let token = AccessToken::with_api_key(API_KEY, API_SECRET)
             .with_grants(VideoGrants {

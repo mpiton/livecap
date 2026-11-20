@@ -38,12 +38,12 @@ async fn main() -> Result<()> {
                 bail!("invalid room name");
             }
             let agent = Agent::new(config);
-            let run = tokio::spawn({
-                let agent = Arc::clone(&agent);
-                async move { agent.run(&room).await }
-            });
+            agent
+                .join(&room)
+                .await
+                .with_context(|| format!("cannot join {room}"))?;
             tokio::select! {
-                result = run => return result.context("agent task failed")?,
+                () = agent.idle() => return Ok(()),
                 signal = stop_signal() => signal?,
             }
             agent.shutdown().await;

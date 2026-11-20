@@ -25,6 +25,9 @@ pub struct Config {
     pub agent_identity: String,
     pub lang_attribute: String,
     pub target_attribute: String,
+    /// Rooms followed at once; `join` answers `full` beyond. Each room holds one Gladia session per
+    /// speaker, so 15 two-person rooms stay under the 30 concurrent sessions of a paid account.
+    pub max_rooms: usize,
     /// Gladia speech threshold (0..1). Higher = fewer captions invented from silence.
     pub speech_threshold: f32,
 }
@@ -48,6 +51,14 @@ impl Config {
                 .unwrap_or_else(|| DEFAULT_LANG_ATTRIBUTE.to_owned()),
             target_attribute: optional("LIVECAP_TARGET_ATTRIBUTE")
                 .unwrap_or_else(|| DEFAULT_TARGET_ATTRIBUTE.to_owned()),
+            max_rooms: match optional("LIVECAP_MAX_ROOMS") {
+                Some(v) => v
+                    .parse()
+                    .ok()
+                    .filter(|n| *n > 0)
+                    .context("LIVECAP_MAX_ROOMS must be a positive integer")?,
+                None => 15,
+            },
             speech_threshold: match optional("GLADIA_SPEECH_THRESHOLD") {
                 Some(v) => v
                     .parse()
