@@ -4,7 +4,8 @@ use std::env;
 
 use anyhow::{Context, Result};
 
-/// Participant attribute holding the language a participant speaks (ISO 639-1, e.g. `fr`).
+/// Participant attribute holding the languages a participant speaks: one code or a comma-separated
+/// list (ISO 639-1, e.g. `fr` or `fr,mg`).
 pub const DEFAULT_LANG_ATTRIBUTE: &str = "livecap.lang";
 /// Participant attribute holding the language this participant wants to read captions in.
 pub const DEFAULT_TARGET_ATTRIBUTE: &str = "livecap.target";
@@ -16,6 +17,8 @@ pub struct Config {
     pub livekit_api_secret: String,
     pub gladia_api_key: String,
     pub gladia_api_url: String,
+    /// Gladia region passed on every session opening (`eu-west` or `us-west`).
+    pub gladia_region: String,
     /// Shared secret for `POST /rooms/{room}/join`. When absent, only signed LiveKit webhooks can start the agent.
     pub join_secret: Option<String>,
     pub listen_addr: String,
@@ -35,6 +38,7 @@ impl Config {
             gladia_api_key: required("GLADIA_API_KEY")?,
             gladia_api_url: optional("GLADIA_API_URL")
                 .unwrap_or_else(|| "https://api.gladia.io".to_owned()),
+            gladia_region: optional("GLADIA_REGION").unwrap_or_else(|| "eu-west".to_owned()),
             join_secret: optional("LIVECAP_JOIN_SECRET"),
             listen_addr: optional("LIVECAP_LISTEN_ADDR")
                 .unwrap_or_else(|| "0.0.0.0:8790".to_owned()),

@@ -88,3 +88,73 @@ async fn no_transcript_or_translation_text_reaches_the_logs() {
         assert!(!logs.contains(word), "`{word}` reached the logs:\n{logs}");
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_list_of_spoken_languages_opens_one_code_switching_session_in_the_region() {
+    let Some(bin) = require_livekit("a_list_of_spoken_languages_opens_one_code_switching_session")
+    else {
+        return;
+    };
+    let _serial = common::LIVEKIT_LOCK.lock().await;
+    let livekit = LiveKitServer::start(bin).await;
+    let gladia = FakeGladia::start().await;
+    let agent =
+        AgentProcess::start(&livekit.url(), &gladia.url(), &[("GLADIA_REGION", "us-west")]).await;
+
+    let (speaker, mut listener) = call(
+        &livekit,
+        &agent,
+        "languages",
+        &[("livecap.lang", "fr, MG"), ("livecap.target", "en")],
+    )
+    .await;
+    assert!(listener.next(WAIT).await.is_some(), "no caption arrived");
+
+    let calls = gladia.calls();
+    assert_eq!(calls.opens.len(), 1);
+    let open = &calls.opens[0];
+    assert_eq!(open.query.as_deref(), Some("region=us-west"));
+    assert_eq!(
+        open.body["language_config"],
+        serde_json::json!({ "languages": ["fr", "mg"], "code_switching": true })
+    );
+    assert_eq!(
+        open.body["realtime_processing"]["translation_config"]["target_languages"],
+        serde_json::json!(["en"])
+    );
+    speaker.leave().await;
+    listener.leave().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_invalid_language_leaves_the_track_uncaptioned_and_the_agent_running() {
+    let Some(bin) = require_livekit("an_invalid_language_leaves_the_track_uncaptioned") else {
+        return;
+    };
+    let _serial = common::LIVEKIT_LOCK.lock().await;
+    let livekit = LiveKitServer::start(bin).await;
+    let gladia = FakeGladia::start().await;
+    let agent = AgentProcess::start(&livekit.url(), &gladia.url(), &[]).await;
+
+    let (speaker, listener) = call(
+        &livekit,
+        &agent,
+        "bad-language",
+        &[("livecap.lang", "fr,zz-Weird value"), ("livecap.target", "en")],
+    )
+    .await;
+    common::livekit::wait_until(WAIT, || async { agent.logs().contains("no captions") }).await;
+    assert!(gladia.calls().opens.is_empty());
+    let logs = agent.logs();
+    assert!(!logs.contains("Weird"), "the attribute value reached the logs:\n{logs}");
+
+    // A second speaker with an empty attribute: still no session, and the agent still answers.
+    let empty = Speaker::join(&livekit.url(), "bad-language", "empty", &[("livecap.lang", " ")]).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(gladia.calls().opens.is_empty());
+    assert_eq!(reqwest::get(format!("{}/health", agent.base_url)).await.unwrap().status(), 200);
+
+    empty.leave().await;
+    speaker.leave().await;
+    listener.leave().await;
+}

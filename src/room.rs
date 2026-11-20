@@ -17,7 +17,7 @@ use tracing::{info, warn};
 use crate::audio::{Chunker, SAMPLE_RATE};
 use crate::config::Config;
 use crate::filter::is_suspect;
-use crate::gladia::{CaptionEvent, CaptionKind, GladiaClient, run_session};
+use crate::gladia::{CaptionEvent, CaptionKind, GladiaClient, parse_languages, run_session};
 
 /// Data topic carrying captions to the people listening to a speaker.
 pub const TOPIC_CAPTIONS: &str = "livecap.captions";
@@ -60,6 +60,7 @@ impl Agent {
         let gladia = GladiaClient::new(
             &config.gladia_api_url,
             &config.gladia_api_key,
+            &config.gladia_region,
             config.speech_threshold,
         );
         Arc::new(Self {
@@ -178,18 +179,29 @@ impl Agent {
     ) -> Result<Speaker> {
         let identity = participant.identity();
         let attributes = participant.attributes();
-        let lang = attributes
+        // The attribute values are never logged: only whether they are usable.
+        let languages = attributes
             .get(&self.config.lang_attribute)
-            .cloned()
+            .and_then(|raw| parse_languages(raw))
             .with_context(|| {
                 format!(
-                    "participant has no `{}` attribute",
+                    "participant has no valid `{}` attribute",
                     self.config.lang_attribute
                 )
             })?;
-        let target = attributes.get(&self.config.target_attribute).cloned();
+        let target = match attributes.get(&self.config.target_attribute) {
+            None => None,
+            Some(raw) => match parse_languages(raw).as_deref() {
+                Some([one]) => Some(one.clone()),
+                _ => {
+                    warn!(speaker = %identity.0, attribute = %self.config.target_attribute, "invalid target language, captions not translated");
+                    None
+                }
+            },
+        };
+        let lang = languages.join(",");
 
-        let session = self.gladia.open(&lang, target.as_deref()).await?;
+        let session = self.gladia.open(&languages, target.as_deref()).await?;
         info!(speaker = %identity.0, %lang, target = target.as_deref().unwrap_or("-"), session = %session.id, "captioning");
         let translate = session.translate;
 

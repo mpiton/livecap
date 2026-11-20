@@ -22,9 +22,11 @@ Early, working prototype. Tested end to end against a local `livekit-server --de
 
 1. Something tells the agent to join a room: a signed LiveKit webhook (`participant_joined`), or `POST /rooms/{room}/join` with a shared secret.
 2. For every audio track it subscribes to, the agent reads two **participant attributes** set in that participant's access token:
-   - `livecap.lang`: the language the participant speaks (ISO 639-1, e.g. `fr`);
-   - `livecap.target`: the language the *other* participant reads (optional; same as `lang` or absent means no translation).
-3. It opens one Gladia live session per speaker, resamples the track to 16 kHz mono PCM and streams it in 40 ms chunks.
+   - `livecap.lang`: the language the participant speaks (ISO 639-1, e.g. `fr`), or a comma-separated list of the languages they mix (e.g. `fr,mg`): with more than one, Gladia's code switching is turned on, restricted to those languages;
+   - `livecap.target`: the language the *other* participant reads (optional; absent, or the only language spoken, means no translation).
+
+   An empty or invalid `livecap.lang` (codes are two or three letters) does not stop the agent: that track gets no captions, and the log says so without the value.
+3. It opens one Gladia live session per speaker, in the configured region, resamples the track to 16 kHz mono PCM and streams it in 40 ms chunks.
 4. It publishes, as JSON data messages:
    - on topic `livecap.self`, to the speaker only: their own live transcript (partials and finals);
    - on topic `livecap.captions`, to everyone else: the translation (or the final transcript when not translating).
@@ -41,7 +43,7 @@ Short utterances that speech models typically invent on silence ("Thank you.", "
   "kind": "partial | final | translation",
   "text": "caption text",
   "original": "source text, for translations",
-  "lang": "speaker language from livecap.lang",
+  "lang": "speaker languages from livecap.lang, normalised (e.g. fr or fr,mg)",
   "detectedLang": "language detected by the model",
   "confidence": 0.84,
   "suspect": false
@@ -53,7 +55,7 @@ Short utterances that speech models typically invent on silence ("Thank you.", "
 ```ts
 const at = new AccessToken(apiKey, apiSecret, {
   identity,
-  attributes: { 'livecap.lang': 'mg', 'livecap.target': 'fr' },
+  attributes: { 'livecap.lang': 'mg,fr', 'livecap.target': 'fr' },
 });
 ```
 
@@ -75,6 +77,7 @@ cargo run --release -- join my-room     # or join one room and exit when it empt
 | `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` | required | LiveKit project |
 | `GLADIA_API_KEY` | required | Gladia key |
 | `GLADIA_API_URL` | `https://api.gladia.io` | override for tests |
+| `GLADIA_REGION` | `eu-west` | Gladia region that processes the audio (`eu-west` or `us-west`), sent on every session opening |
 | `GLADIA_SPEECH_THRESHOLD` | `0.75` | 0 to 1; higher ignores more background noise |
 | `LIVECAP_JOIN_SECRET` | none | bearer secret for `POST /rooms/{room}/join`; without it only webhooks work |
 | `LIVECAP_LISTEN_ADDR` | `0.0.0.0:8790` | HTTP address |
@@ -101,7 +104,7 @@ cargo test
 runs the unit tests and the integration tests under `tests/`. None of them calls Gladia or LiveKit Cloud:
 
 - `tests/common/fake_gladia.rs` is a fake Gladia live API (`POST /v2/live`, the session WebSocket, `DELETE /v2/live/{id}`, and `GET /calls` to replay what it received). It answers every session with captions written in advance; the agent is pointed at it with `GLADIA_API_URL`.
-- `tests/agent.rs` runs the `livecap` binary against that fake and a local `livekit-server` in dev mode, with test participants that publish a tone and read the captions. It also checks that no transcript or translation text reaches the agent's logs (captured at `RUST_LOG=debug`).
+- `tests/agent.rs` runs the `livecap` binary against that fake and a local `livekit-server` in dev mode, with test participants that publish a tone and read the captions. It also checks that no transcript or translation text reaches the agent's logs (captured at `RUST_LOG=debug,livekit=info,livekit_api=info,libwebrtc=info`: at `debug` the LiveKit SDK itself prints whole signalling messages, see [Logs](docs/deploy.md#logs)).
 
 The end-to-end tests need a `livekit-server` binary (1.13 or later) named by `LIVEKIT_SERVER_BIN`; without it they are **skipped** and print `SKIPPED <test>: set LIVEKIT_SERVER_BIN ...`. CI downloads a pinned release and checks its SHA-256. Locally:
 

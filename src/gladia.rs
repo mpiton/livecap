@@ -21,6 +21,7 @@ pub struct GladiaClient {
     http: reqwest::Client,
     base_url: String,
     api_key: String,
+    region: String,
     speech_threshold: f32,
 }
 
@@ -52,22 +53,34 @@ pub struct CaptionEvent {
 }
 
 impl GladiaClient {
-    pub fn new(base_url: &str, api_key: &str, speech_threshold: f32) -> Self {
+    pub fn new(base_url: &str, api_key: &str, region: &str, speech_threshold: f32) -> Self {
         Self {
             http: reqwest::Client::new(),
             base_url: base_url.trim_end_matches('/').to_owned(),
             api_key: api_key.to_owned(),
+            region: region.to_owned(),
             speech_threshold,
         }
     }
 
-    /// Opens a live session for one speaker. `target` = language the listener reads; `None` or equal to `lang` = no translation.
-    pub async fn open(&self, lang: &str, target: Option<&str>) -> Result<Session> {
-        let target = target.filter(|t| *t != lang);
-        let body = session_body(lang, target, self.speech_threshold);
+    /// Opens a live session for one speaker who speaks `languages` (at least one).
+    ///
+    /// `target` is the language the listener reads. There is no translation when it is absent or
+    /// when it is the only language spoken. More than one language turns on code switching,
+    /// restricted to those languages.
+    ///
+    /// # Errors
+    ///
+    /// Gladia unreachable, or refusing the session.
+    pub async fn open(&self, languages: &[String], target: Option<&str>) -> Result<Session> {
+        let target = target.filter(|t| languages != [*t]);
+        let body = session_body(languages, target, self.speech_threshold);
+        let mut url = reqwest::Url::parse(&format!("{}/v2/live", self.base_url))
+            .context("invalid GLADIA_API_URL")?;
+        url.query_pairs_mut().append_pair("region", &self.region);
         let response = self
             .http
-            .post(format!("{}/v2/live", self.base_url))
+            .post(url)
             .header("x-gladia-key", &self.api_key)
             .json(&body)
             .send()
@@ -95,13 +108,36 @@ impl GladiaClient {
     }
 }
 
-fn session_body(lang: &str, target: Option<&str>, speech_threshold: f32) -> serde_json::Value {
+/// Parses a language attribute: one code or a comma-separated list, e.g. `fr` or `fr, mg`.
+///
+/// Codes are two or three ASCII letters (ISO 639), compared case-insensitively; duplicates are
+/// dropped. Returns `None` when the value is empty or any code is invalid.
+pub fn parse_languages(raw: &str) -> Option<Vec<String>> {
+    let mut languages: Vec<String> = Vec::new();
+    for code in raw.split(',') {
+        let code = code.trim().to_ascii_lowercase();
+        let valid = (2..=3).contains(&code.len()) && code.bytes().all(|b| b.is_ascii_lowercase());
+        if !valid {
+            return None;
+        }
+        if !languages.contains(&code) {
+            languages.push(code);
+        }
+    }
+    Some(languages)
+}
+
+fn session_body(
+    languages: &[String],
+    target: Option<&str>,
+    speech_threshold: f32,
+) -> serde_json::Value {
     let mut body = json!({
         "encoding": "wav/pcm",
         "sample_rate": SAMPLE_RATE,
         "bit_depth": 16,
         "channels": 1,
-        "language_config": { "languages": [lang], "code_switching": false },
+        "language_config": { "languages": languages, "code_switching": languages.len() > 1 },
         "pre_processing": { "speech_threshold": speech_threshold },
         "messages_config": {
             "receive_partial_transcripts": true,
@@ -289,7 +325,7 @@ pub fn parse_message(raw: &str) -> Result<Option<CaptionEvent>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CaptionKind, parse_message, session_body};
+    use super::{CaptionKind, parse_languages, parse_message, session_body};
 
     #[test]
     fn parses_partial_and_final_transcripts() -> anyhow::Result<()> {
@@ -333,9 +369,26 @@ mod tests {
 
     #[test]
     fn translation_only_when_languages_differ() {
-        let with = session_body("mg", Some("fr"), 0.75);
+        let with = session_body(&["mg".to_owned()], Some("fr"), 0.75);
         assert!(with.get("realtime_processing").is_some());
-        let without = session_body("fr", None, 0.75);
+        let without = session_body(&["fr".to_owned()], None, 0.75);
         assert!(without.get("realtime_processing").is_none());
+    }
+
+    #[test]
+    fn languages_are_one_code_or_a_comma_separated_list() {
+        assert_eq!(parse_languages("fr"), Some(vec!["fr".to_owned()]));
+        assert_eq!(
+            parse_languages(" fr, MG ,fr"),
+            Some(vec!["fr".to_owned(), "mg".to_owned()])
+        );
+        assert_eq!(parse_languages("haw"), Some(vec!["haw".to_owned()]));
+    }
+
+    #[test]
+    fn empty_or_invalid_languages_are_refused() {
+        for raw in ["", " ", "fr,", "fr,,mg", "f", "fren", "fr-FR", "12", "fr;mg"] {
+            assert_eq!(parse_languages(raw), None, "{raw:?}");
+        }
     }
 }
