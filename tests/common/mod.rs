@@ -1,6 +1,9 @@
 //! Test bench shared by the integration tests: a fake Gladia and a local LiveKit server.
 
-#![allow(dead_code, reason = "each test binary uses a different part of the bench")]
+#![allow(
+    dead_code,
+    reason = "each test binary uses a different part of the bench"
+)]
 
 pub mod fake_gladia;
 pub mod livekit;

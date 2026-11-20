@@ -101,7 +101,9 @@ impl LiveKitServer {
         self.child = Some(child);
         let url = format!("http://127.0.0.1:{}/", self.port);
         wait_until(Duration::from_secs(15), || async {
-            reqwest::get(&url).await.is_ok_and(|r| r.status().is_success())
+            reqwest::get(&url)
+                .await
+                .is_ok_and(|r| r.status().is_success())
         })
         .await;
     }
@@ -254,7 +256,9 @@ fn collect<R: tokio::io::AsyncRead + Unpin + Send + 'static>(reader: R, logs: Ar
     tokio::spawn(async move {
         let mut lines = BufReader::new(reader).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            let mut logs = logs.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut logs = logs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             logs.push_str(&line);
             logs.push('\n');
         }

@@ -362,7 +362,10 @@ mod tests {
     #[test]
     fn errors_never_carry_caption_text() {
         let raw = r#"{"type":"error","error":{"code":"limit"},"data":{"utterance":{"text":"private words"}}}"#;
-        let err = parse_message(raw).err().map(|e| format!("{e:#}")).unwrap_or_default();
+        let err = parse_message(raw)
+            .err()
+            .map(|e| format!("{e:#}"))
+            .unwrap_or_default();
         assert!(err.contains("limit"), "{err}");
         assert!(!err.contains("private"), "{err}");
     }
@@ -387,7 +390,9 @@ mod tests {
 
     #[test]
     fn empty_or_invalid_languages_are_refused() {
-        for raw in ["", " ", "fr,", "fr,,mg", "f", "fren", "fr-FR", "12", "fr;mg"] {
+        for raw in [
+            "", " ", "fr,", "fr,,mg", "f", "fren", "fr-FR", "12", "fr;mg",
+        ] {
             assert_eq!(parse_languages(raw), None, "{raw:?}");
         }
     }

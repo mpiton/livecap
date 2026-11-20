@@ -22,7 +22,10 @@ async fn call(
     let listener = Listener::join(&livekit.url(), room, "listener", CAPTIONS).await;
     let speaker = Speaker::join(&livekit.url(), room, "speaker", attributes).await;
     let (status, body) = agent.join(room).await;
-    assert!((200..300).contains(&status), "join answered {status} {body}");
+    assert!(
+        (200..300).contains(&status),
+        "join answered {status} {body}"
+    );
     (speaker, listener)
 }
 
@@ -83,7 +86,10 @@ async fn no_transcript_or_translation_text_reaches_the_logs() {
     listener.leave().await;
 
     let logs = agent.logs();
-    assert!(logs.contains("captioning"), "the agent logged nothing useful:\n{logs}");
+    assert!(
+        logs.contains("captioning"),
+        "the agent logged nothing useful:\n{logs}"
+    );
     for word in ["Quokka", "quokka", "seventy", "soixante"] {
         assert!(!logs.contains(word), "`{word}` reached the logs:\n{logs}");
     }
@@ -98,8 +104,12 @@ async fn a_list_of_spoken_languages_opens_one_code_switching_session_in_the_regi
     let _serial = common::LIVEKIT_LOCK.lock().await;
     let livekit = LiveKitServer::start(bin).await;
     let gladia = FakeGladia::start().await;
-    let agent =
-        AgentProcess::start(&livekit.url(), &gladia.url(), &[("GLADIA_REGION", "us-west")]).await;
+    let agent = AgentProcess::start(
+        &livekit.url(),
+        &gladia.url(),
+        &[("GLADIA_REGION", "us-west")],
+    )
+    .await;
 
     let (speaker, mut listener) = call(
         &livekit,
@@ -140,19 +150,37 @@ async fn an_invalid_language_leaves_the_track_uncaptioned_and_the_agent_running(
         &livekit,
         &agent,
         "bad-language",
-        &[("livecap.lang", "fr,zz-Weird value"), ("livecap.target", "en")],
+        &[
+            ("livecap.lang", "fr,zz-Weird value"),
+            ("livecap.target", "en"),
+        ],
     )
     .await;
     common::livekit::wait_until(WAIT, || async { agent.logs().contains("no captions") }).await;
     assert!(gladia.calls().opens.is_empty());
     let logs = agent.logs();
-    assert!(!logs.contains("Weird"), "the attribute value reached the logs:\n{logs}");
+    assert!(
+        !logs.contains("Weird"),
+        "the attribute value reached the logs:\n{logs}"
+    );
 
     // A second speaker with an empty attribute: still no session, and the agent still answers.
-    let empty = Speaker::join(&livekit.url(), "bad-language", "empty", &[("livecap.lang", " ")]).await;
+    let empty = Speaker::join(
+        &livekit.url(),
+        "bad-language",
+        "empty",
+        &[("livecap.lang", " ")],
+    )
+    .await;
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert!(gladia.calls().opens.is_empty());
-    assert_eq!(reqwest::get(format!("{}/health", agent.base_url)).await.unwrap().status(), 200);
+    assert_eq!(
+        reqwest::get(format!("{}/health", agent.base_url))
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
 
     empty.leave().await;
     speaker.leave().await;

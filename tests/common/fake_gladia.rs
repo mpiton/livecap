@@ -69,7 +69,9 @@ struct Shared(Arc<Mutex<Inner>>);
 
 impl Shared {
     fn lock(&self) -> MutexGuard<'_, Inner> {
-        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -133,7 +135,10 @@ async fn open(
         body: serde_json::from_str(&body).unwrap_or(Value::String(body)),
     });
     let url = format!("ws://127.0.0.1:{}/v2/live/{id}", inner.ws_port);
-    (StatusCode::CREATED, axum::Json(json!({ "id": id, "url": url })))
+    (
+        StatusCode::CREATED,
+        axum::Json(json!({ "id": id, "url": url })),
+    )
 }
 
 async fn remove(State(shared): State<Shared>, Path(id): Path<String>) -> StatusCode {
