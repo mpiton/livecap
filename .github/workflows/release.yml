@@ -1,0 +1,63 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  ASSET: livecap-x86_64-unknown-linux-gnu
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check that the tag matches the crate version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "tag $GITHUB_REF_NAME does not match version $version in Cargo.toml" >&2
+            exit 1
+          fi
+      - name: Install clang 21 and glib headers (required by libwebrtc)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q libglib2.0-dev
+          wget -q https://apt.llvm.org/llvm.sh
+          sudo bash llvm.sh 21
+          echo "CC=clang-21" >> "$GITHUB_ENV"
+          echo "CXX=clang++-21" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Download livekit-server for the end-to-end tests (pinned, checksum verified)
+        env:
+          LIVEKIT_VERSION: 1.13.11
+          LIVEKIT_SHA256: 1e9ee90ca301e1842b2887fc77cb122759756a9c8aeb4334ee91de3325ec43fb
+        run: |
+          dir="$RUNNER_TEMP/livekit"
+          archive="livekit_${LIVEKIT_VERSION}_linux_amd64.tar.gz"
+          mkdir -p "$dir"
+          curl -fsSL -o "$dir/$archive" "https://github.com/livekit/livekit/releases/download/v${LIVEKIT_VERSION}/$archive"
+          echo "${LIVEKIT_SHA256}  $dir/$archive" | sha256sum --check --strict
+          tar -xzf "$dir/$archive" -C "$dir" livekit-server
+          echo "LIVEKIT_SERVER_BIN=$dir/livekit-server" >> "$GITHUB_ENV"
+      - name: Test the tagged commit
+        run: cargo test --locked
+      - name: Build
+        run: cargo build --release --locked
+      - name: Package the binary and its checksum
+        run: |
+          mkdir dist
+          cp target/release/livecap "dist/$ASSET"
+          cd dist
+          sha256sum "$ASSET" > "$ASSET.sha256"
+          cat "$ASSET.sha256"
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" "dist/$ASSET" "dist/$ASSET.sha256" \
+            --title "$GITHUB_REF_NAME" --generate-notes --verify-tag

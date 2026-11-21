@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::json;
@@ -13,6 +13,10 @@ use tracing::{debug, info, warn};
 use crate::audio::SAMPLE_RATE;
 
 const MAX_RECONNECTS: u32 = 5;
+/// Attempts to delete a session before giving up. Gladia answers 409 until a finished session
+/// has been traced, which takes a few seconds; 6 attempts from 500 ms, doubling, span about 15 s.
+const DELETE_ATTEMPTS: u32 = 6;
+const DELETE_FIRST_DELAY: Duration = Duration::from_millis(500);
 /// How long to wait for the last results after `stop_recording`.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -21,7 +25,10 @@ pub struct GladiaClient {
     http: reqwest::Client,
     base_url: String,
     api_key: String,
+    region: String,
     speech_threshold: f32,
+    delete_attempts: u32,
+    delete_first_delay: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -52,22 +59,91 @@ pub struct CaptionEvent {
 }
 
 impl GladiaClient {
-    pub fn new(base_url: &str, api_key: &str, speech_threshold: f32) -> Self {
+    pub fn new(base_url: &str, api_key: &str, region: &str, speech_threshold: f32) -> Self {
         Self {
             http: reqwest::Client::new(),
             base_url: base_url.trim_end_matches('/').to_owned(),
             api_key: api_key.to_owned(),
+            region: region.to_owned(),
             speech_threshold,
+            delete_attempts: DELETE_ATTEMPTS,
+            delete_first_delay: DELETE_FIRST_DELAY,
         }
     }
 
-    /// Opens a live session for one speaker. `target` = language the listener reads; `None` or equal to `lang` = no translation.
-    pub async fn open(&self, lang: &str, target: Option<&str>) -> Result<Session> {
-        let target = target.filter(|t| *t != lang);
-        let body = session_body(lang, target, self.speech_threshold);
+    /// Sets how many times [`Self::delete`] tries, and its first delay (doubled at each retry).
+    #[must_use]
+    pub fn with_delete_retries(mut self, attempts: u32, first_delay: Duration) -> Self {
+        self.delete_attempts = attempts.max(1);
+        self.delete_first_delay = first_delay;
+        self
+    }
+
+    /// Deletes a session (`DELETE /v2/live/{id}`), so Gladia keeps neither audio nor transcript.
+    ///
+    /// Retries with a doubling delay while Gladia refuses or is unreachable. A session Gladia no
+    /// longer knows (404) counts as deleted.
+    ///
+    /// # Errors
+    ///
+    /// Every attempt failed.
+    pub async fn delete(&self, id: &str) -> Result<()> {
+        let mut delay = self.delete_first_delay;
+        let mut attempt = 1;
+        loop {
+            match self.delete_once(id).await {
+                Ok(()) => return Ok(()),
+                Err(err) if attempt >= self.delete_attempts => {
+                    return Err(err.context(format!("{attempt} attempts")));
+                }
+                Err(err) => {
+                    debug!(session = %id, attempt, error = %format!("{err:#}"), "Gladia session deletion failed, retrying");
+                }
+            }
+            tokio::time::sleep(delay).await;
+            delay = delay.saturating_mul(2);
+            attempt += 1;
+        }
+    }
+
+    async fn delete_once(&self, id: &str) -> Result<()> {
+        let mut url = reqwest::Url::parse(&self.base_url).context("invalid GLADIA_API_URL")?;
+        url.path_segments_mut()
+            .map_err(|()| anyhow!("invalid GLADIA_API_URL"))?
+            .extend(["v2", "live", id]);
         let response = self
             .http
-            .post(format!("{}/v2/live", self.base_url))
+            .delete(url)
+            .header("x-gladia-key", &self.api_key)
+            .send()
+            .await
+            .context("Gladia unreachable")?;
+        let status = response.status();
+        if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
+            Ok(())
+        } else {
+            bail!("Gladia answered {status}")
+        }
+    }
+
+    /// Opens a live session for one speaker who speaks `languages` (at least one).
+    ///
+    /// `target` is the language the listener reads. There is no translation when it is absent or
+    /// when it is the only language spoken. More than one language turns on code switching,
+    /// restricted to those languages.
+    ///
+    /// # Errors
+    ///
+    /// Gladia unreachable, or refusing the session.
+    pub async fn open(&self, languages: &[String], target: Option<&str>) -> Result<Session> {
+        let target = target.filter(|t| languages != [*t]);
+        let body = session_body(languages, target, self.speech_threshold);
+        let mut url = reqwest::Url::parse(&format!("{}/v2/live", self.base_url))
+            .context("invalid GLADIA_API_URL")?;
+        url.query_pairs_mut().append_pair("region", &self.region);
+        let response = self
+            .http
+            .post(url)
             .header("x-gladia-key", &self.api_key)
             .json(&body)
             .send()
@@ -95,13 +171,36 @@ impl GladiaClient {
     }
 }
 
-fn session_body(lang: &str, target: Option<&str>, speech_threshold: f32) -> serde_json::Value {
+/// Parses a language attribute: one code or a comma-separated list, e.g. `fr` or `fr, mg`.
+///
+/// Codes are two or three ASCII letters (ISO 639), compared case-insensitively; duplicates are
+/// dropped. Returns `None` when the value is empty or any code is invalid.
+pub fn parse_languages(raw: &str) -> Option<Vec<String>> {
+    let mut languages: Vec<String> = Vec::new();
+    for code in raw.split(',') {
+        let code = code.trim().to_ascii_lowercase();
+        let valid = (2..=3).contains(&code.len()) && code.bytes().all(|b| b.is_ascii_lowercase());
+        if !valid {
+            return None;
+        }
+        if !languages.contains(&code) {
+            languages.push(code);
+        }
+    }
+    Some(languages)
+}
+
+fn session_body(
+    languages: &[String],
+    target: Option<&str>,
+    speech_threshold: f32,
+) -> serde_json::Value {
     let mut body = json!({
         "encoding": "wav/pcm",
         "sample_rate": SAMPLE_RATE,
         "bit_depth": 16,
         "channels": 1,
-        "language_config": { "languages": [lang], "code_switching": false },
+        "language_config": { "languages": languages, "code_switching": languages.len() > 1 },
         "pre_processing": { "speech_threshold": speech_threshold },
         "messages_config": {
             "receive_partial_transcripts": true,
@@ -166,7 +265,13 @@ pub async fn run_session(
                 } => match message {
                     Some(Ok(Message::Text(text))) => forward(text.as_str(), &events).await,
                     Some(Ok(Message::Close(_))) | None if stopping => return Ok(()),
-                    Some(Ok(Message::Close(_))) | None => break,
+                    // Gladia closes the WebSocket itself only when the session is over (an error,
+                    // or its maximum duration): reconnecting to it would fail the same way.
+                    Some(Ok(Message::Close(frame))) => {
+                        let code = frame.map_or(0, |f| u16::from(f.code));
+                        bail!("Gladia closed session {} (code {code})", session.id);
+                    }
+                    None => break,
                     Some(Ok(_)) => {}
                     Some(Err(_)) if stopping => return Ok(()),
                     Some(Err(err)) => {
@@ -229,11 +334,15 @@ struct Translated {
 
 /// Maps one Gladia WebSocket message to a caption event (`Ok(None)` for messages we don't use).
 pub fn parse_message(raw: &str) -> Result<Option<CaptionEvent>> {
-    let envelope: Envelope = serde_json::from_str(raw)?;
+    // Neither the raw message nor serde's error text (which quotes values) may end up in an
+    // error: both can hold caption text, and errors are logged.
+    let envelope: Envelope = serde_json::from_str(raw)
+        .map_err(|err| anyhow!("malformed Gladia message ({:?})", err.classify()))?;
     if envelope.kind == "error" || envelope.error.is_some() {
+        let detail = envelope.error.map(|e| e.to_string()).unwrap_or_default();
         bail!(
             "Gladia error: {}",
-            raw.chars().take(300).collect::<String>()
+            detail.chars().take(300).collect::<String>()
         );
     }
     let Some(data) = envelope.data else {
@@ -285,7 +394,7 @@ pub fn parse_message(raw: &str) -> Result<Option<CaptionEvent>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CaptionKind, parse_message, session_body};
+    use super::{CaptionKind, parse_languages, parse_message, session_body};
 
     #[test]
     fn parses_partial_and_final_transcripts() -> anyhow::Result<()> {
@@ -320,10 +429,40 @@ mod tests {
     }
 
     #[test]
+    fn errors_never_carry_caption_text() {
+        let raw = r#"{"type":"error","error":{"code":"limit"},"data":{"utterance":{"text":"private words"}}}"#;
+        let err = parse_message(raw)
+            .err()
+            .map(|e| format!("{e:#}"))
+            .unwrap_or_default();
+        assert!(err.contains("limit"), "{err}");
+        assert!(!err.contains("private"), "{err}");
+    }
+
+    #[test]
     fn translation_only_when_languages_differ() {
-        let with = session_body("mg", Some("fr"), 0.75);
+        let with = session_body(&["mg".to_owned()], Some("fr"), 0.75);
         assert!(with.get("realtime_processing").is_some());
-        let without = session_body("fr", None, 0.75);
+        let without = session_body(&["fr".to_owned()], None, 0.75);
         assert!(without.get("realtime_processing").is_none());
+    }
+
+    #[test]
+    fn languages_are_one_code_or_a_comma_separated_list() {
+        assert_eq!(parse_languages("fr"), Some(vec!["fr".to_owned()]));
+        assert_eq!(
+            parse_languages(" fr, MG ,fr"),
+            Some(vec!["fr".to_owned(), "mg".to_owned()])
+        );
+        assert_eq!(parse_languages("haw"), Some(vec!["haw".to_owned()]));
+    }
+
+    #[test]
+    fn empty_or_invalid_languages_are_refused() {
+        for raw in [
+            "", " ", "fr,", "fr,,mg", "f", "fren", "fr-FR", "12", "fr;mg",
+        ] {
+            assert_eq!(parse_languages(raw), None, "{raw:?}");
+        }
     }
 }

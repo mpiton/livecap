@@ -1,0 +1,11 @@
+# /etc/caddy/Caddyfile: one address per environment, TLS certificates managed by Caddy.
+# No `log` directive on purpose: access logs would record room names (in /rooms/{room}/join)
+# and client addresses. See docs/deploy.md.
+
+captions-preprod.example.org {
+	reverse_proxy 127.0.0.1:8791
+}
+
+captions.example.org {
+	reverse_proxy 127.0.0.1:8792
+}
