@@ -18,7 +18,7 @@ listener ◄──captions──┴── data message ─┘
 
 ## Status
 
-Young, but meant for production: v0.2 moves to Azure AI Speech (configurable region, `francecentral` by default) and Azure Translator, with several locales per speaker, suspect finals kept from listeners, a `join` that answers only once the agent is in the room, a room cap, a graceful stop and recovery from LiveKit and Azure outages. CI runs every change against a fake Azure AI Speech, a fake Azure Translator and a local `livekit-server --dev`. Tagged releases publish a Linux x86_64 binary; see [docs/deploy.md](docs/deploy.md) to run it with systemd and Caddy. Expect breaking changes before 1.0.
+Young, but meant for production (v0.2.1): v0.2 moved to Azure AI Speech (configurable region, `francecentral` by default) and Azure Translator, with several locales per speaker, suspect finals kept from listeners, a `join` that answers only once the agent is in the room, a room cap, a graceful stop and recovery from LiveKit and Azure outages. CI runs every change against a fake Azure AI Speech, a fake Azure Translator and a local `livekit-server --dev`. Tagged releases publish a Linux x86_64 binary; see [docs/deploy.md](docs/deploy.md) to run it with systemd and Caddy. Expect breaking changes before 1.0.
 
 ## How it works
 
@@ -127,7 +127,7 @@ cargo run --release -- join my-room     # or join one room and exit when it empt
 - `GET /health` answers `200` with the version and the load, never a room name:
 
   ```json
-  { "status": "ok", "version": "0.2.0", "rooms": 1, "sessions": 2, "maxRooms": 15 }
+  { "status": "ok", "version": "0.2.1", "rooms": 1, "sessions": 2, "maxRooms": 15 }
   ```
 
   `status` is `draining` once the agent is stopping.

@@ -105,9 +105,14 @@ async fn turning_transcription_off_closes_the_connection_and_tells_the_listeners
         listener.next(Duration::from_secs(1)).await.is_none(),
         "something was sent after the stop"
     );
+    // The closed session is in the logs, by its id only (mpiton/crossluv#963). The logs are
+    // collected from a pipe: wait for the line before reading them.
+    wait_until(WAIT, || async {
+        agent.logs().contains("Azure Speech session closed")
+    })
+    .await;
     let logs = agent.logs();
     assert!(!logs.contains(TRANSCRIPT) && !logs.contains(TRANSLATION));
-    // The closed session is in the logs, by its id only (mpiton/crossluv#963).
     let logs = without_colors(&logs);
     let session = session_id(&logs).expect("no captioning line with a session id");
     let closed = logs

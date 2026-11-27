@@ -220,12 +220,13 @@ impl Session {
     ///
     /// Logs `Azure Speech session closed` with the speaker and the session id only, like the end
     /// of a call: the aborted task never reaches its own log line (mpiton/crossluv#963). The line
-    /// is written when the abort is requested; the socket is dropped the next time the runtime
-    /// polls the task, and no audio follows since the pump is aborted first.
-    fn stop(self, speaker: &ParticipantIdentity) {
+    /// is written once the speech task is gone, so its WebSocket is dropped by then.
+    async fn stop(self, speaker: &ParticipantIdentity) {
         self.pump.abort();
         self.speech.abort();
         self.publisher.abort();
+        // An aborted task resolves to a cancellation error once it is dropped: nothing to report.
+        let _ = self.speech.await;
         info!(speaker = %speaker.0, session = %self.id, reason = "transcription switched off", "Azure Speech session closed");
     }
 }
@@ -710,7 +711,7 @@ impl Agent {
         let status = match (on, speaker.session.take()) {
             (false, Some(session)) => {
                 info!(speaker = %identity.0, "transcription switched off");
-                session.stop(&identity);
+                session.stop(&identity).await;
                 "stopped"
             }
             (true, None) => {

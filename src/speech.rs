@@ -50,15 +50,13 @@ pub const DEFAULT_MIN_CONFIDENCE: f32 = 0.5;
 /// With several locales Azure returns exactly 0.9 on some finals whatever was said, invented
 /// text included (mpiton/crossluv#962: Malagasy heard as `fr-FR,en-US` gives five finals at 0.9
 /// whose words are all at 0.0, while real French and English phrases score 0.69 to 0.93). Such a
-/// final is judged on the confidence of its words instead. A real phrase that happens to score
-/// exactly 0.9 loses nothing: its words average to the same value.
-const PLACEHOLDER_CONFIDENCE: f32 = 0.9;
-
-/// How close to [`PLACEHOLDER_CONFIDENCE`] a confidence must be to count as that placeholder.
+/// final is judged on the confidence of its words instead. A real phrase that scores exactly 0.9
+/// is judged on its words too: on real speech their mean equals the phrase confidence, so it
+/// keeps a close value (and may drop below the threshold only if its words are weak).
 ///
-/// Azure sends `0.9` in JSON, which parses to the same `f32`; the margin only absorbs rounding
-/// and stays far below the gap between two real measures (Azure gives eight digits).
-const PLACEHOLDER_TOLERANCE: f32 = 1e-6;
+/// Azure sends `0.9` in JSON, which parses to this exact `f32`; measured values carry eight
+/// digits, so only the placeholder compares equal.
+const PLACEHOLDER_CONFIDENCE: f32 = 0.9;
 
 /// How long to wait for the last results after the end of the audio.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
@@ -770,7 +768,7 @@ fn to_event(
 
 /// Whether `confidence` is the [`PLACEHOLDER_CONFIDENCE`] of continuous language detection.
 fn is_placeholder(confidence: f32) -> bool {
-    (confidence - PLACEHOLDER_CONFIDENCE).abs() < PLACEHOLDER_TOLERANCE
+    confidence.to_bits() == PLACEHOLDER_CONFIDENCE.to_bits()
 }
 
 /// `RecognitionStatus` values that mean the request failed rather than heard nothing.
