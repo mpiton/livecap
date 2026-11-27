@@ -13,6 +13,9 @@ use crate::translator;
 pub const DEFAULT_LANG_ATTRIBUTE: &str = "livecap.lang";
 /// Participant attribute holding the language this participant wants to read captions in.
 pub const DEFAULT_TARGET_ATTRIBUTE: &str = "livecap.target";
+/// Participant attribute switching the transcription of a participant's voice: `on` or absent,
+/// transcribed; any other value, `off` included, not transcribed and no connection to Azure.
+pub const DEFAULT_TRANSCRIBE_ATTRIBUTE: &str = "livecap.transcribe";
 
 /// Default limit on the calls still running after SIGTERM: two hours, the longest call expected.
 /// The service manager's stop timeout must be longer (see `docs/deploy.md`).
@@ -43,6 +46,7 @@ pub struct Config {
     pub agent_identity: String,
     pub lang_attribute: String,
     pub target_attribute: String,
+    pub transcribe_attribute: String,
     /// Rooms followed at once; `join` answers `full` beyond. Each room holds one Azure Speech
     /// connection per speaker.
     pub max_rooms: usize,
@@ -82,6 +86,8 @@ impl Config {
                 .unwrap_or_else(|| DEFAULT_LANG_ATTRIBUTE.to_owned()),
             target_attribute: optional("LIVECAP_TARGET_ATTRIBUTE")
                 .unwrap_or_else(|| DEFAULT_TARGET_ATTRIBUTE.to_owned()),
+            transcribe_attribute: optional("LIVECAP_TRANSCRIBE_ATTRIBUTE")
+                .unwrap_or_else(|| DEFAULT_TRANSCRIBE_ATTRIBUTE.to_owned()),
             max_rooms: match optional("LIVECAP_MAX_ROOMS") {
                 Some(v) => v
                     .parse()

@@ -36,6 +36,14 @@ Young, but meant for production: v0.2.0 moves to Azure AI Speech (configurable r
 6. When Azure closes or drops the connection mid-call, the agent reconnects with a doubling delay (0.5 s up to 8 s); after 8 failures in a row it stops captioning that speaker, without affecting the room. Live transcription keeps neither the audio nor the text at Azure; livecap never turns on audio logging (`storeAudio`) and never asks Azure for diarization or speaker identification.
 7. It leaves when the last participant does, or after 20 seconds alone in a room.
 
+### Stopping the transcription of one voice
+
+The application can stop the transcription of a participant's voice during a call, not just hide the captions: it sets the participant attribute `livecap.transcribe` (name set by `LIVECAP_TRANSCRIBE_ATTRIBUTE`) through LiveKit's server API (`RoomService.UpdateParticipant`).
+
+- `off` (or any value other than `on`): the agent closes that voice's Azure connection at once, without waiting for the last results; no audio goes to Azure any more and nothing more is translated or sent. The listeners get `{"kind":"status","speaker":"<identity>","status":"stopped"}` on `livecap.captions`.
+- `on`, or no attribute (removed with an empty value): the agent opens a new connection and the listeners get `"status":"resumed"`; captions start again.
+- A participant who joins with the attribute already `off` opens no connection. `/health` counts only the open connections.
+
 ### Stopping and outages
 
 - On **SIGTERM** (or Ctrl-C) the agent drains: `join` answers `503 {"error":"draining"}`, `/health` reports `"status":"draining"`, and the calls in progress go on until they end or `LIVECAP_DRAIN_TIMEOUT_SECS` (2 hours by default) runs out. It then leaves the remaining rooms, ends their Azure connections and exits with status 0. A second signal skips the wait. Give the service manager a longer stop timeout than the drain (see [docs/deploy.md](docs/deploy.md)).
@@ -57,6 +65,12 @@ Besides, short utterances that speech models typically invent on silence ("Thank
   "confidence": 0.84,
   "suspect": false
 }
+```
+
+When a speaker's transcription is switched off or back on (see above), the listeners get a status message on `livecap.captions` instead:
+
+```json
+{ "kind": "status", "speaker": "participant identity", "status": "stopped | resumed" }
 ```
 
 ### Setting the attributes (Node.js server SDK)
@@ -99,6 +113,7 @@ cargo run --release -- join my-room     # or join one room and exit when it empt
 | `LIVECAP_LISTEN_ADDR` | `0.0.0.0:8790` | HTTP address |
 | `LIVECAP_AGENT_IDENTITY` | `livecap` | identity of the hidden participant |
 | `LIVECAP_LANG_ATTRIBUTE`, `LIVECAP_TARGET_ATTRIBUTE` | `livecap.lang`, `livecap.target` | attribute names |
+| `LIVECAP_TRANSCRIBE_ATTRIBUTE` | `livecap.transcribe` | attribute switching a voice's transcription: `on` or absent, transcribed; anything else, `off` included, not |
 | `RUST_LOG` | `info` | log filter |
 
 ### HTTP API

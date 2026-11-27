@@ -150,6 +150,30 @@ impl LiveKitServer {
             .unwrap_or_default()
     }
 
+    /// Sets attributes of `identity` in `room` through `RoomService.UpdateParticipant`, as an
+    /// application server does. An empty value removes the attribute.
+    pub async fn set_attributes(&self, room: &str, identity: &str, attributes: &[(&str, &str)]) {
+        let attributes: serde_json::Map<String, Value> = attributes
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), Value::from(*v)))
+            .collect();
+        let body = self
+            .twirp(
+                "UpdateParticipant",
+                serde_json::json!({ "room": room, "identity": identity, "attributes": attributes }),
+                VideoGrants {
+                    room_admin: true,
+                    room: room.to_owned(),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert_eq!(
+            body["identity"], identity,
+            "UpdateParticipant answered {body}"
+        );
+    }
+
     async fn twirp(&self, method: &str, body: Value, grants: VideoGrants) -> Value {
         let token = AccessToken::with_api_key(API_KEY, API_SECRET)
             .with_grants(grants)

@@ -170,8 +170,78 @@ pub struct CaptionPayload<'a> {
     pub suspect: bool,
 }
 
+/// What the listeners receive on [`TOPIC_CAPTIONS`] when a speaker's transcription stops or
+/// resumes through the transcribe attribute.
+#[derive(Debug, Serialize, PartialEq)]
+pub struct StatusPayload<'a> {
+    pub kind: &'static str,
+    pub speaker: &'a str,
+    pub status: &'static str,
+}
+
+/// A speaker whose audio track the agent follows.
 struct Speaker {
+    /// Kept to open a new transcription when the speaker resumes it.
+    track: RemoteAudioTrack,
+    plan: Plan,
+    /// `None` while the speaker's transcription is switched off: no connection to Azure.
+    session: Option<Session>,
+}
+
+impl Speaker {
+    /// Ends the transcription gracefully: the audio stops, Azure sends its last results.
+    fn end(self) {
+        if let Some(session) = self.session {
+            session.pump.abort();
+        }
+    }
+}
+
+/// How a speaker is transcribed, read from their attributes when their track arrives.
+#[derive(Clone)]
+struct Plan {
+    locales: Vec<String>,
+    lang: String,
+    target: Option<String>,
+}
+
+/// One open transcription: the audio pump, the Azure Speech connection and the publisher.
+struct Session {
     pump: JoinHandle<()>,
+    speech: JoinHandle<()>,
+    publisher: JoinHandle<()>,
+}
+
+impl Session {
+    /// Stops at once: no more audio to Azure, the connection dropped without waiting for the
+    /// last results, nothing more translated or published.
+    fn stop(self) {
+        self.pump.abort();
+        self.speech.abort();
+        self.publisher.abort();
+    }
+}
+
+/// One open Azure Speech connection in [`Gauge`], until dropped (an aborted task included).
+struct OpenSession(Arc<Gauge>);
+
+impl OpenSession {
+    fn new(gauge: Arc<Gauge>) -> Self {
+        gauge.increment();
+        Self(gauge)
+    }
+}
+
+impl Drop for OpenSession {
+    fn drop(&mut self) {
+        self.0.decrement();
+    }
+}
+
+/// Whether a transcribe attribute value lets the agent transcribe: `on` or no attribute. Any
+/// other value stops it, so a wrong value never sends a voice to Azure.
+fn transcribes(value: Option<&String>) -> bool {
+    value.is_none_or(|v| v.trim().is_empty() || v.trim().eq_ignore_ascii_case("on"))
 }
 
 impl Agent {
@@ -451,7 +521,7 @@ impl Agent {
                 } => {
                     let identity = participant.identity();
                     if let Some(old) = speakers.remove(&identity) {
-                        old.pump.abort();
+                        old.end();
                     }
                     match self
                         .start_speaker(Arc::clone(&room), &participant, track)
@@ -471,13 +541,21 @@ impl Agent {
                     ..
                 } => {
                     if let Some(old) = speakers.remove(&participant.identity()) {
-                        old.pump.abort();
+                        old.end();
+                    }
+                }
+                RoomEvent::ParticipantAttributesChanged {
+                    participant: Participant::Remote(participant),
+                    ..
+                } => {
+                    if let Some(speaker) = speakers.get_mut(&participant.identity()) {
+                        self.switch(&room, &participant, speaker).await;
                     }
                 }
                 RoomEvent::ParticipantConnected(_) => alone_until = None,
                 RoomEvent::ParticipantDisconnected(participant) => {
                     if let Some(old) = speakers.remove(&participant.identity()) {
-                        old.pump.abort();
+                        old.end();
                     }
                     // While the SDK reconnects it drops every participant; people coming back
                     // then reappear, so only a departure on a live connection ends the call.
@@ -510,7 +588,7 @@ impl Agent {
         };
 
         for speaker in speakers.into_values() {
-            speaker.pump.abort();
+            speaker.end();
         }
         room.close().await.ok();
         info!(room = room_name, "agent left");
@@ -589,20 +667,85 @@ impl Agent {
                 }
             },
         };
-        let lang = locales.join(",");
+        let plan = Plan {
+            lang: locales.join(","),
+            locales,
+            target,
+        };
+        let session = if transcribes(attributes.get(&self.config.transcribe_attribute)) {
+            Some(self.open_session(room, &identity, &plan, &track))
+        } else {
+            info!(speaker = %identity.0, "transcription switched off, not captioning");
+            None
+        };
+        Ok(Speaker {
+            track,
+            plan,
+            session,
+        })
+    }
+
+    /// Stops or resumes `speaker`'s transcription when their transcribe attribute changed, and
+    /// tells the listeners.
+    async fn switch(
+        &self,
+        room: &Arc<Room>,
+        participant: &RemoteParticipant,
+        speaker: &mut Speaker,
+    ) {
+        let identity = participant.identity();
+        let on = transcribes(
+            participant
+                .attributes()
+                .get(&self.config.transcribe_attribute),
+        );
+        let status = match (on, speaker.session.take()) {
+            (false, Some(session)) => {
+                session.stop();
+                info!(speaker = %identity.0, "transcription switched off");
+                "stopped"
+            }
+            (true, None) => {
+                speaker.session = Some(self.open_session(
+                    Arc::clone(room),
+                    &identity,
+                    &speaker.plan,
+                    &speaker.track,
+                ));
+                info!(speaker = %identity.0, "transcription switched back on");
+                "resumed"
+            }
+            (_, session) => {
+                speaker.session = session;
+                return;
+            }
+        };
+        publish_status(room, &identity, status).await;
+    }
+
+    /// Opens an Azure Speech connection for `identity` and starts sending their audio to it.
+    fn open_session(
+        &self,
+        room: Arc<Room>,
+        identity: &ParticipantIdentity,
+        plan: &Plan,
+        track: &RemoteAudioTrack,
+    ) -> Session {
         let session = new_id();
-        info!(speaker = %identity.0, %lang, target = target.as_deref().unwrap_or("-"), %session, "captioning");
+        info!(speaker = %identity.0, lang = %plan.lang, target = plan.target.as_deref().unwrap_or("-"), %session, "captioning");
 
         let (audio_tx, audio_rx) = mpsc::channel::<Vec<u8>>(AUDIO_BUFFER);
         let (event_tx, event_rx) = mpsc::channel::<CaptionEvent>(64);
 
-        // The connection ends when the audio channel closes (speaker gone, room left) or after
-        // too many failed reconnections. Azure keeps neither the audio nor the text of a live
-        // transcription, so nothing is left to delete. Only the session id is logged.
-        self.sessions.increment();
-        let sessions = Arc::clone(&self.sessions);
+        // The connection ends when the audio channel closes (speaker gone, room left), when the
+        // speaker switches transcription off (the task is aborted) or after too many failed
+        // reconnections. Azure keeps neither the audio nor the text of a live transcription, so
+        // nothing is left to delete. Only the session id is logged.
+        let open = OpenSession::new(Arc::clone(&self.sessions));
         let speech = self.speech.clone();
-        tokio::spawn(async move {
+        let locales = plan.locales.clone();
+        let speech = tokio::spawn(async move {
+            let _open = open;
             match speech
                 .transcribe(&session, &locales, audio_rx, event_tx)
                 .await
@@ -612,19 +755,19 @@ impl Agent {
                     warn!(%session, error = %format!("{err:#}"), "Azure Speech session ended")
                 }
             }
-            sessions.decrement();
         });
-        tokio::spawn(publish_captions(
+        let publisher = tokio::spawn(publish_captions(
             room,
             identity.clone(),
-            lang,
-            target,
+            plan.lang.clone(),
+            plan.target.clone(),
             self.translator.clone(),
             event_rx,
         ));
 
+        let rtc_track = track.rtc_track();
         let pump = tokio::spawn(async move {
-            let mut stream = NativeAudioStream::new(track.rtc_track(), SAMPLE_RATE as i32, 1);
+            let mut stream = NativeAudioStream::new(rtc_track, SAMPLE_RATE as i32, 1);
             let mut chunker = Chunker::default();
             while let Some(frame) = stream.next().await {
                 for chunk in chunker.push(&frame.data) {
@@ -635,7 +778,40 @@ impl Agent {
                 }
             }
         });
-        Ok(Speaker { pump })
+        Session {
+            pump,
+            speech,
+            publisher,
+        }
+    }
+}
+
+/// Tells everyone but `speaker` that their transcription stopped or resumed.
+async fn publish_status(room: &Room, speaker: &ParticipantIdentity, status: &'static str) {
+    let listeners: Vec<ParticipantIdentity> = room
+        .remote_participants()
+        .into_keys()
+        .filter(|id| id != speaker)
+        .collect();
+    if listeners.is_empty() {
+        return;
+    }
+    let payload = StatusPayload {
+        kind: "status",
+        speaker: &speaker.0,
+        status,
+    };
+    let Ok(bytes) = serde_json::to_vec(&payload) else {
+        return;
+    };
+    let packet = DataPacket {
+        payload: bytes,
+        topic: Some(TOPIC_CAPTIONS.to_owned()),
+        reliable: true,
+        destination_identities: listeners,
+    };
+    if let Err(err) = room.local_participant().publish_data(packet).await {
+        warn!(%err, "cannot send the transcription status");
     }
 }
 
@@ -785,7 +961,32 @@ fn to_payload<'a>(event: &'a CaptionEvent, speaker: &'a str, lang: &'a str) -> C
 mod tests {
     use std::time::Duration;
 
-    use super::{http_base, reconnect_delay, to_payload};
+    use super::{StatusPayload, http_base, reconnect_delay, to_payload, transcribes};
+
+    #[test]
+    fn only_on_or_no_attribute_lets_the_agent_transcribe() {
+        let value = |v: &str| Some(v.to_owned());
+        assert!(transcribes(None));
+        assert!(transcribes(value("on").as_ref()));
+        assert!(transcribes(value(" ON ").as_ref()));
+        assert!(transcribes(value("").as_ref()));
+        assert!(!transcribes(value("off").as_ref()));
+        assert!(!transcribes(value("no").as_ref()));
+    }
+
+    #[test]
+    fn the_status_message_names_the_speaker_and_the_status() -> anyhow::Result<()> {
+        let payload = StatusPayload {
+            kind: "status",
+            speaker: "aline",
+            status: "stopped",
+        };
+        assert_eq!(
+            serde_json::to_value(payload)?,
+            serde_json::json!({ "kind": "status", "speaker": "aline", "status": "stopped" })
+        );
+        Ok(())
+    }
 
     #[test]
     fn reconnection_delays_grow_and_stay_bounded() {
