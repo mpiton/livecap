@@ -26,6 +26,12 @@ KillSignal=SIGTERM
 KillMode=mixed
 TimeoutStopSec=2h 5min
 
+# On a host shared with other workloads (builds, tests), captions keep priority on the CPU and
+# livecap cannot take the host's memory. 1 GiB holds the default room cap (15 rooms, two voices
+# each) with room to spare; raise it with LIVECAP_MAX_ROOMS.
+CPUWeight=500
+MemoryMax=1G
+
 # Logs go to the journal; livecap never logs caption text (see docs/deploy.md, Logs).
 StandardOutput=journal
 StandardError=journal

@@ -55,7 +55,10 @@ The template unit gives each instance `livecap@<environment>`:
 - `User=livecap-<environment>`, `EnvironmentFile=/etc/livecap/<environment>.env`, `ExecStart=/opt/livecap/<environment>/current/livecap serve`;
 - `Restart=always`, so a crash or an unexpected exit restarts it after two seconds;
 - `KillSignal=SIGTERM` and `TimeoutStopSec=2h 5min`. On SIGTERM livecap drains: it answers `503 draining` to new joins, lets the calls in progress end, for at most `LIVECAP_DRAIN_TIMEOUT_SECS` (two hours by default), ends their Azure connections, and exits. The stop timeout must stay above the drain timeout plus about 30 seconds, or systemd kills calls in progress. To stop at once anyway, send a second signal: `sudo systemctl kill --signal=SIGTERM livecap@preprod`;
-- a sandbox (`ProtectSystem=strict`, no capabilities, no new privileges...): livecap only needs the network.
+- a sandbox (`ProtectSystem=strict`, `ProtectHome`, no capabilities, no new privileges...): livecap only needs the network;
+- `CPUWeight=500` and `MemoryMax=1G`, for a host shared with other workloads: captions keep priority on the CPU over builds and tests, and livecap cannot exhaust the host's memory. Raise `MemoryMax` with `LIVECAP_MAX_ROOMS`.
+
+On a shared host, also keep the environment files and `/opt/livecap` out of other users' reach (the commands above do), and never give the `livecap-*` users a login shell or a home directory with other secrets.
 
 Install the first release (see [Updating](#updating)), then enable both instances:
 

@@ -165,6 +165,7 @@ runs the unit tests and the integration tests under `tests/`. None of them calls
 - `tests/common/fake_speech.rs` is a fake Azure AI Speech: it accepts the Speech SDK WebSocket on `/stt/speech/universal/v2` (and the one-language `/speech/recognition/conversation/cognitiveservices/v1`), records the URL, the headers, `speech.config`, `speech.context` and the audio frames (RIFF header, then PCM), answers with `speech.hypothesis`, `speech.phrase` (confidence, detected language) and `turn.end` written in advance, can send a low-confidence or undeclared-language final and cut connections mid-stream, and replays what it received on `GET /calls`. The agent is pointed at it with `AZURE_SPEECH_URL`.
 - `tests/common/fake_translator.rs` is a fake Azure Translator: `POST /translate?api-version=3.0` records the key and region headers, `from`, `to` and the text, and answers a translation written in advance, or an error on demand. The agent is pointed at it with `AZURE_TRANSLATOR_URL`.
 - `tests/speech.rs` drives the Azure clients against those fakes and pins what they send.
+- `tests/transcribe.rs` runs the binary the same way and switches a speaker's transcription off and on through `RoomService.UpdateParticipant`, as an application does.
 - `tests/agent.rs` runs the `livecap` binary against the fakes and a local `livekit-server` in dev mode, with test participants that publish a tone and read the captions. It also checks that no transcript, no translation and no key reaches the agent's logs (captured at `RUST_LOG=debug,livekit=info,livekit_api=info,libwebrtc=info`: at `debug` the LiveKit SDK itself prints whole signalling messages, see [Logs](docs/deploy.md#logs)).
 
 The end-to-end tests need a `livekit-server` binary (1.13 or later) named by `LIVEKIT_SERVER_BIN`; without it they are **skipped** and print `SKIPPED <test>: set LIVEKIT_SERVER_BIN ...`, except on CI (`CI` set), where a missing binary fails them. CI downloads a pinned release and checks its SHA-256. Locally:
@@ -193,6 +194,13 @@ A failure there while the fakes pass means Microsoft changed the protocol: see t
 ## Costs, for reference
 
 Azure AI Speech, real-time speech to text (S0, November 2026): about €0.90 per hour of audio per speaker. Azure Translator: $10 per million characters, about 900 characters per minute of conversation. The agent counts as one more LiveKit participant.
+
+## Releasing
+
+1. Run the canary (above) against the real Azure on the commit to tag, and note the result in the release issue.
+2. Make sure the `version` of `Cargo.toml` is the version to release (the release workflow refuses a tag that does not match it).
+3. `git tag vX.Y.Z && git push origin vX.Y.Z`: [.github/workflows/release.yml](.github/workflows/release.yml) runs the tests, builds `livecap-x86_64-unknown-linux-gnu` with clang 21, and publishes it with its `.sha256` in a GitHub release.
+4. Install it with the update script of [docs/deploy.md](docs/deploy.md#updating), `preprod` first.
 
 ## Roadmap
 
