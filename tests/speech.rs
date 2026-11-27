@@ -187,7 +187,7 @@ async fn several_locales_turn_on_continuous_language_detection_among_them_only()
             },
             "phraseOutput": {
                 "format": "Detailed",
-                "detailed": { "options": [] },
+                "detailed": { "options": ["WordTimings"] },
                 "interimResults": { "resultType": "Auto" },
                 "phraseResults": { "resultType": "Always" }
             }
@@ -262,6 +262,66 @@ async fn a_final_in_an_undeclared_language_is_suspect() {
         ..Phrase::default()
     };
     assert!(final_with(elsewhere, &["fr-FR", "en-US"]).await.suspect);
+}
+
+/// Azure's placeholder confidence in continuous language detection (mpiton/crossluv#962).
+const PLACEHOLDER: f64 = 0.9;
+
+#[tokio::test]
+async fn in_language_detection_a_placeholder_confidence_with_unconfident_words_is_suspect() {
+    // Malagasy heard as French and English: 0.9 on the phrase, 0.0 on every word.
+    let invented = Phrase {
+        confidence: PLACEHOLDER,
+        language: Some("en-US"),
+        words: Some(vec![Some(0.0); 3]),
+        ..Phrase::default()
+    };
+    let fin = final_with(invented, &["fr-FR", "en-US"]).await;
+    assert!(fin.suspect, "{fin:#?}");
+    assert_eq!(fin.confidence, Some(0.0));
+}
+
+#[tokio::test]
+async fn in_language_detection_a_placeholder_confidence_without_word_confidences_is_suspect() {
+    for words in [None, Some(vec![None, None])] {
+        let bare = Phrase {
+            confidence: PLACEHOLDER,
+            language: Some("fr-FR"),
+            words,
+            ..Phrase::default()
+        };
+        let fin = final_with(bare, &["fr-FR", "en-US"]).await;
+        assert!(fin.suspect, "{fin:#?}");
+        assert_eq!(fin.confidence, None);
+    }
+}
+
+#[tokio::test]
+async fn in_language_detection_a_placeholder_confidence_with_confident_words_is_kept() {
+    let real = Phrase {
+        confidence: PLACEHOLDER,
+        language: Some("fr-FR"),
+        words: Some(vec![Some(0.9), Some(0.8), Some(0.7)]),
+        ..Phrase::default()
+    };
+    let fin = final_with(real, &["fr-FR", "en-US"]).await;
+    assert!(!fin.suspect, "{fin:#?}");
+    assert!(
+        fin.confidence.is_some_and(|c| (c - 0.8).abs() < 1e-6),
+        "{fin:#?}"
+    );
+}
+
+#[tokio::test]
+async fn with_one_locale_a_confidence_of_0_9_is_a_real_measure() {
+    let one = Phrase {
+        confidence: PLACEHOLDER,
+        language: None,
+        ..Phrase::default()
+    };
+    let fin = final_with(one, &["en-US"]).await;
+    assert!(!fin.suspect, "{fin:#?}");
+    assert_eq!(fin.confidence, Some(0.9));
 }
 
 #[tokio::test]

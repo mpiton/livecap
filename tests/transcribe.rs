@@ -107,8 +107,43 @@ async fn turning_transcription_off_closes_the_connection_and_tells_the_listeners
     );
     let logs = agent.logs();
     assert!(!logs.contains(TRANSCRIPT) && !logs.contains(TRANSLATION));
+    // The closed session is in the logs, by its id only (mpiton/crossluv#963).
+    let logs = without_colors(&logs);
+    let session = session_id(&logs).expect("no captioning line with a session id");
+    let closed = logs
+        .lines()
+        .find(|l| l.contains("Azure Speech session closed") && l.contains(&session))
+        .unwrap_or_else(|| panic!("no closed line for session {session}: {logs}"));
+    assert!(closed.contains("speaker=speaker"), "{closed}");
+    assert!(closed.contains("transcription switched off"), "{closed}");
     speaker.leave().await;
     listener.leave().await;
+}
+
+/// `logs` without the ANSI color codes `tracing-subscriber` may write around field names.
+fn without_colors(logs: &str) -> String {
+    let mut plain = String::with_capacity(logs.len());
+    let mut chars = logs.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            // `ESC [ ... m`: skip up to the final letter.
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            plain.push(c);
+        }
+    }
+    plain
+}
+
+/// Session id of the first `captioning` line of the agent's logs.
+fn session_id(logs: &str) -> Option<String> {
+    let line = logs.lines().find(|l| l.contains("captioning"))?;
+    let id = line.split("session=").nth(1)?.split_whitespace().next()?;
+    Some(id.trim_matches('"').to_owned())
 }
 
 #[tokio::test(flavor = "multi_thread")]

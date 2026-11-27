@@ -45,6 +45,21 @@ pub const MAX_LOCALES: usize = 10;
 /// measured on real calls.
 pub const DEFAULT_MIN_CONFIDENCE: f32 = 0.5;
 
+/// Phrase confidence Azure reports in continuous language detection when it has no real measure.
+///
+/// With several locales Azure returns exactly 0.9 on some finals whatever was said, invented
+/// text included (mpiton/crossluv#962: Malagasy heard as `fr-FR,en-US` gives five finals at 0.9
+/// whose words are all at 0.0, while real French and English phrases score 0.69 to 0.93). Such a
+/// final is judged on the confidence of its words instead. A real phrase that happens to score
+/// exactly 0.9 loses nothing: its words average to the same value.
+const PLACEHOLDER_CONFIDENCE: f32 = 0.9;
+
+/// How close to [`PLACEHOLDER_CONFIDENCE`] a confidence must be to count as that placeholder.
+///
+/// Azure sends `0.9` in JSON, which parses to the same `f32`; the margin only absorbs rounding
+/// and stays far below the gap between two real measures (Azure gives eight digits).
+const PLACEHOLDER_TOLERANCE: f32 = 1e-6;
+
 /// How long to wait for the last results after the end of the audio.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
 /// How long the WebSocket handshake may take.
@@ -71,6 +86,8 @@ pub struct CaptionEvent {
     pub original: Option<String>,
     /// Locale detected by Azure for this utterance (or the speaker's only locale).
     pub language: Option<String>,
+    /// Confidence the final was judged on: the phrase confidence, or the mean confidence of its
+    /// words when Azure sent [`PLACEHOLDER_CONFIDENCE`] (or none) in language detection.
     pub confidence: Option<f32>,
     /// Set on finals Azure did not recognize, recognized with a low confidence, or in a language
     /// the speaker did not declare: they never reach the listeners.
@@ -114,7 +131,8 @@ impl SpeechClient {
     /// WebSocket URL for a speaker who speaks `locales`.
     ///
     /// `src/common.speech/SpeechConnectionFactory.ts` and `QueryParameterNames.ts`: `language`
-    /// with one locale, `lidEnabled=true` with several, `format=detailed` for the confidence.
+    /// with one locale, `lidEnabled=true` with several, `format=detailed` for the confidence
+    /// (the word confidences come from `speech.context`, see [`speech_context`]).
     /// Never `storeAudio`: Azure would keep the audio and the transcripts.
     pub fn url(&self, locales: &[String]) -> Result<String> {
         let mut url = reqwest::Url::parse(&format!("{}{PATH}", self.base_url))
@@ -462,8 +480,11 @@ pub fn speech_config() -> Value {
 /// `src/common.speech/ServiceRecognizerBase.ts`: `recognize` (`phraseDetection.mode`, here
 /// `Conversation`), `setLanguageJson` (`phraseDetection.language` with one locale),
 /// `setLanguageIdJson` (`languageId` in `DetectContinuous` mode, with `phraseOutput`, for
-/// several), and `SpeechContext.ts` `setDetailedOutputFormat`. No `speakerDiarization` and no
-/// speaker identification: livecap never asks who speaks.
+/// several), and `SpeechContext.ts` `setDetailedOutputFormat`. With several locales it also asks
+/// for the words (`SpeechContext.ts`, `setWordLevelTimings`: `WordTimings` in
+/// `phraseOutput.detailed.options`), whose confidences judge a final that came with
+/// [`PLACEHOLDER_CONFIDENCE`]. No `speakerDiarization` and no speaker identification: livecap
+/// never asks who speaks.
 pub fn speech_context(locales: &[String]) -> Value {
     let detailed = json!({ "format": "Detailed", "detailed": { "options": [] } });
     if let [one] = locales {
@@ -483,7 +504,7 @@ pub fn speech_context(locales: &[String]) -> Value {
         },
         "phraseOutput": {
             "format": "Detailed",
-            "detailed": { "options": [] },
+            "detailed": { "options": ["WordTimings"] },
             "interimResults": { "resultType": "Auto" },
             "phraseResults": { "resultType": "Always" }
         }
@@ -574,6 +595,8 @@ pub enum Answer {
         status: String,
         text: String,
         confidence: Option<f32>,
+        /// Mean confidence of the words of the best result, when Azure sent words with one.
+        word_confidence: Option<f32>,
         language: Option<String>,
     },
     /// Anything else (`turn.start`, `speech.startDetected`…).
@@ -608,6 +631,28 @@ struct Phrase {
 struct Best {
     confidence: Option<f32>,
     display: Option<String>,
+    /// Only with `WordTimings` asked; each word has a confidence in continuous language detection.
+    #[serde(default)]
+    words: Vec<Word>,
+}
+
+/// `src/common.speech/ServiceMessages/DetailedSpeechPhrase.ts` (`IWord`), plus the `Confidence`
+/// the service adds to each word.
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct Word {
+    confidence: Option<f32>,
+}
+
+/// Mean confidence of the words that carry one, or `None` when none does.
+fn mean_confidence(words: &[Word]) -> Option<f32> {
+    let known: Vec<f32> = words.iter().filter_map(|w| w.confidence).collect();
+    if known.is_empty() {
+        return None;
+    }
+    // A phrase has a few dozen words, far below 2^24: the count is exact as an `f32`.
+    let count = known.len() as f32;
+    Some(known.iter().sum::<f32>() / count)
 }
 
 #[derive(Deserialize)]
@@ -639,6 +684,7 @@ pub fn parse_answer(path: &str, body: &str) -> Result<Answer> {
             let p: Phrase = serde_json::from_str(body).map_err(malformed)?;
             let best = p.n_best.into_iter().next();
             let confidence = best.as_ref().and_then(|b| b.confidence);
+            let word_confidence = best.as_ref().and_then(|b| mean_confidence(&b.words));
             let text = best
                 .and_then(|b| b.display)
                 .or(p.display_text)
@@ -647,6 +693,7 @@ pub fn parse_answer(path: &str, body: &str) -> Result<Answer> {
                 status: p.recognition_status,
                 text: text.trim().to_owned(),
                 confidence,
+                word_confidence,
                 language: p.primary_language.and_then(|l| l.language),
             })
         }
@@ -680,12 +727,20 @@ fn to_event(
             status,
             text,
             confidence,
+            word_confidence,
             language,
         } if !text.is_empty() => {
             let language = language.or_else(fallback);
             let declared = language
                 .as_deref()
                 .is_some_and(|l| locales.iter().any(|d| d.eq_ignore_ascii_case(l)));
+            // In language detection a phrase confidence of exactly 0.9 (or none) is no measure:
+            // the words decide, and without word confidences the final stays unjudged.
+            let confidence = if locales.len() > 1 && confidence.is_none_or(is_placeholder) {
+                word_confidence
+            } else {
+                confidence
+            };
             // A final without a confidence is not trusted: with one locale the threshold is the
             // only guard against an uncovered language transcribed as the declared one.
             let confident = confidence.is_some_and(|c| c >= min_confidence);
@@ -707,6 +762,11 @@ fn to_event(
         }
         _ => None,
     }
+}
+
+/// Whether `confidence` is the [`PLACEHOLDER_CONFIDENCE`] of continuous language detection.
+fn is_placeholder(confidence: f32) -> bool {
+    (confidence - PLACEHOLDER_CONFIDENCE).abs() < PLACEHOLDER_TOLERANCE
 }
 
 /// `RecognitionStatus` values that mean the request failed rather than heard nothing.
@@ -918,6 +978,7 @@ mod tests {
             status: status.to_owned(),
             text: "Bonjour".to_owned(),
             confidence: Some(confidence),
+            word_confidence: None,
             language: language.map(str::to_owned),
         }
     }
@@ -958,7 +1019,7 @@ mod tests {
             to_event(answer, list, 0.5, u).map(|e| e.suspect)
         };
         assert_eq!(
-            suspect(phrase("Success", 0.9, Some("fr-FR")), &two, &mut u),
+            suspect(phrase("Success", 0.91, Some("fr-FR")), &two, &mut u),
             Some(false)
         );
         assert_eq!(
@@ -966,15 +1027,15 @@ mod tests {
             Some(true)
         );
         assert_eq!(
-            suspect(phrase("Success", 0.9, Some("mg-MG")), &two, &mut u),
+            suspect(phrase("Success", 0.91, Some("mg-MG")), &two, &mut u),
             Some(true)
         );
         assert_eq!(
-            suspect(phrase("Success", 0.9, None), &two, &mut u),
+            suspect(phrase("Success", 0.91, None), &two, &mut u),
             Some(true)
         );
         assert_eq!(
-            suspect(phrase("BabbleTimeout", 0.9, Some("fr-FR")), &two, &mut u),
+            suspect(phrase("BabbleTimeout", 0.91, Some("fr-FR")), &two, &mut u),
             Some(true)
         );
         let one = locales(&["fr-FR"]);
@@ -982,6 +1043,48 @@ mod tests {
             suspect(phrase("Success", 0.9, None), &one, &mut u),
             Some(false)
         );
+    }
+
+    #[test]
+    fn in_language_detection_a_placeholder_confidence_is_judged_on_the_words() -> anyhow::Result<()>
+    {
+        // mpiton/crossluv#962: Malagasy heard as `fr-FR,en-US` comes back at exactly 0.9 with
+        // every word at 0.0; real French keeps its words around the phrase confidence.
+        let two = locales(&["fr-FR", "en-US"]);
+        let judge = |body: &str, list: &[String]| -> anyhow::Result<(Option<f32>, bool)> {
+            let mut u = Utterances::new("S");
+            let event = to_event(parse_answer("speech.phrase", body)?, list, 0.5, &mut u)
+                .ok_or_else(|| anyhow::anyhow!("none"))?;
+            Ok((event.confidence, event.suspect))
+        };
+        let invented = r#"{"RecognitionStatus":"Success","PrimaryLanguage":{"Language":"en-US"},"NBest":[{"Confidence":0.9,"Display":"Basla van.","Words":[{"Word":"basla","Offset":1,"Duration":2,"Confidence":0.0},{"Word":"van","Offset":3,"Duration":2,"Confidence":0.0}]}]}"#;
+        assert_eq!(judge(invented, &two)?, (Some(0.0), true));
+
+        let real = r#"{"RecognitionStatus":"Success","PrimaryLanguage":{"Language":"fr-FR"},"NBest":[{"Confidence":0.9,"Display":"Bonjour Claire.","Words":[{"Word":"bonjour","Confidence":0.95},{"Word":"claire","Confidence":0.75}]}]}"#;
+        let (confidence, suspect) = judge(real, &two)?;
+        assert!(!suspect);
+        assert!(
+            confidence.is_some_and(|c| (c - 0.85).abs() < 1e-6),
+            "{confidence:?}"
+        );
+
+        // No words to judge on: never shown as reliable.
+        let bare = r#"{"RecognitionStatus":"Success","PrimaryLanguage":{"Language":"en-US"},"NBest":[{"Confidence":0.9,"Display":"For translation."}]}"#;
+        assert_eq!(judge(bare, &two)?, (None, true));
+        let wordless = r#"{"RecognitionStatus":"Success","PrimaryLanguage":{"Language":"en-US"},"NBest":[{"Confidence":0.9,"Display":"For translation.","Words":[{"Word":"for"},{"Word":"translation"}]}]}"#;
+        assert_eq!(judge(wordless, &two)?, (None, true));
+        let missing = r#"{"RecognitionStatus":"Success","PrimaryLanguage":{"Language":"en-US"},"NBest":[{"Display":"For translation.","Words":[{"Word":"for","Confidence":0.8}]}]}"#;
+        assert_eq!(judge(missing, &two)?, (Some(0.8), false));
+
+        // A measured phrase confidence is kept, whatever its words say.
+        let measured = r#"{"RecognitionStatus":"Success","PrimaryLanguage":{"Language":"fr-FR"},"NBest":[{"Confidence":0.78,"Display":"Bonjour.","Words":[{"Word":"bonjour","Confidence":0.1}]}]}"#;
+        assert_eq!(judge(measured, &two)?, (Some(0.78), false));
+
+        // With one locale there is no language detection and 0.9 is a real measure.
+        let one = locales(&["fr-FR"]);
+        let bare_fr = bare.replace("en-US", "fr-FR");
+        assert_eq!(judge(&bare_fr, &one)?, (Some(0.9), false));
+        Ok(())
     }
 
     #[test]
