@@ -23,7 +23,7 @@ Thanks for helping. Small, focused pull requests are easiest to review.
 
 ## Adding a speech-to-text provider
 
-Providers live behind the session runner in `src/gladia.rs` today. A `SpeechProvider` trait is on the roadmap; open an issue first so we agree on its shape.
+The speech provider lives in `src/speech.rs` (Azure AI Speech) and the translation in `src/translator.rs` (Azure Translator) today. A `SpeechProvider` trait is on the roadmap; open an issue first so we agree on its shape.
 
 ## Code of conduct
 

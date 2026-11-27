@@ -20,7 +20,7 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    // Several TLS backends are linked in (LiveKit, Gladia, HTTP): pick one explicitly.
+    // Several TLS backends are linked in (LiveKit, Azure, HTTP): pick one explicitly.
     if rustls::crypto::ring::default_provider()
         .install_default()
         .is_err()

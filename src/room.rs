@@ -1,6 +1,6 @@
 //! Joins a LiveKit room as a hidden agent and captions every speaker.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -18,7 +18,8 @@ use tracing::{info, warn};
 use crate::audio::{Chunker, SAMPLE_RATE};
 use crate::config::Config;
 use crate::filter::is_suspect;
-use crate::gladia::{CaptionEvent, CaptionKind, GladiaClient, parse_languages, run_session};
+use crate::speech::{CaptionEvent, CaptionKind, SpeechClient, new_id, parse_locales};
+use crate::translator::{TranslatorClient, parse_target, same_language, translator_code};
 
 /// Data topic carrying captions to the people listening to a speaker.
 pub const TOPIC_CAPTIONS: &str = "livecap.captions";
@@ -44,13 +45,14 @@ const ROOM_GONE_CHECKS: u32 = 3;
 /// reconnected. Matches LiveKit's default `departure_timeout`.
 const ALONE_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// How long [`Agent::shutdown`] waits for the open Gladia sessions to be deleted. Covers the
-/// last results (3 s) and the deletion retries (about 15 s).
-const SESSIONS_DELETION_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long [`Agent::shutdown`] waits for the Azure Speech connections to close. Covers the last
+/// results (3 s) and a reconnection delay in progress (8 s at most).
+const SESSIONS_CLOSE_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub struct Agent {
     config: Config,
-    gladia: GladiaClient,
+    speech: SpeechClient,
+    translator: TranslatorClient,
     http: reqwest::Client,
     /// Rooms followed or being joined, with the state of their join.
     rooms: Mutex<HashMap<String, watch::Receiver<RoomState>>>,
@@ -168,21 +170,96 @@ pub struct CaptionPayload<'a> {
     pub suspect: bool,
 }
 
+/// What the listeners receive on [`TOPIC_CAPTIONS`] when a speaker's transcription stops or
+/// resumes through the transcribe attribute.
+#[derive(Debug, Serialize, PartialEq)]
+pub struct StatusPayload<'a> {
+    pub kind: &'static str,
+    pub speaker: &'a str,
+    pub status: &'static str,
+}
+
+/// A speaker whose audio track the agent follows.
 struct Speaker {
+    /// Kept to open a new transcription when the speaker resumes it.
+    track: RemoteAudioTrack,
+    plan: Plan,
+    /// `None` while the speaker's transcription is switched off: no connection to Azure.
+    session: Option<Session>,
+}
+
+impl Speaker {
+    /// Ends the transcription gracefully: the audio stops, Azure sends its last results.
+    fn end(self) {
+        if let Some(session) = self.session {
+            session.pump.abort();
+        }
+    }
+}
+
+/// How a speaker is transcribed, read from their attributes when their track arrives.
+#[derive(Clone)]
+struct Plan {
+    locales: Vec<String>,
+    lang: String,
+    target: Option<String>,
+}
+
+/// One open transcription: the audio pump, the Azure Speech connection and the publisher.
+struct Session {
     pump: JoinHandle<()>,
+    speech: JoinHandle<()>,
+    publisher: JoinHandle<()>,
+}
+
+impl Session {
+    /// Stops at once: no more audio to Azure, the connection dropped without waiting for the
+    /// last results, nothing more translated or published.
+    fn stop(self) {
+        self.pump.abort();
+        self.speech.abort();
+        self.publisher.abort();
+    }
+}
+
+/// One open Azure Speech connection in [`Gauge`], until dropped (an aborted task included).
+struct OpenSession(Arc<Gauge>);
+
+impl OpenSession {
+    fn new(gauge: Arc<Gauge>) -> Self {
+        gauge.increment();
+        Self(gauge)
+    }
+}
+
+impl Drop for OpenSession {
+    fn drop(&mut self) {
+        self.0.decrement();
+    }
+}
+
+/// Whether a transcribe attribute value lets the agent transcribe: `on` or no attribute. Any
+/// other value stops it, so a wrong value never sends a voice to Azure.
+fn transcribes(value: Option<&String>) -> bool {
+    value.is_none_or(|v| v.trim().is_empty() || v.trim().eq_ignore_ascii_case("on"))
 }
 
 impl Agent {
     pub fn new(config: Config) -> Arc<Self> {
-        let gladia = GladiaClient::new(
-            &config.gladia_api_url,
-            &config.gladia_api_key,
-            &config.gladia_region,
-            config.speech_threshold,
+        let speech = SpeechClient::new(
+            &config.azure_speech_url,
+            &config.azure_speech_key,
+            config.azure_speech_min_confidence,
+        );
+        let translator = TranslatorClient::new(
+            &config.azure_translator_url,
+            &config.azure_translator_key,
+            config.azure_translator_region.as_deref(),
         );
         Arc::new(Self {
             config,
-            gladia,
+            speech,
+            translator,
             http: reqwest::Client::new(),
             rooms: Mutex::new(HashMap::new()),
             rooms_changed: Notify::new(),
@@ -217,7 +294,7 @@ impl Agent {
     }
 
     /// Stops taking rooms, lets the current calls finish for at most `deadline`, then leaves
-    /// whatever is left and waits until the Gladia sessions are deleted.
+    /// whatever is left and waits until the Azure Speech connections are closed.
     ///
     /// Resolves early, leaving at once, if `hurry` resolves first (a second stop signal).
     pub async fn drain(&self, deadline: Duration, hurry: impl Future<Output = ()>) {
@@ -239,16 +316,16 @@ impl Agent {
         self.shutdown().await;
     }
 
-    /// Leaves every room now and waits until their Gladia sessions are deleted.
+    /// Leaves every room now and waits until their Azure Speech connections are closed.
     pub async fn shutdown(&self) {
         self.leave.send_replace(true);
-        if tokio::time::timeout(SESSIONS_DELETION_TIMEOUT, self.sessions.zero())
+        if tokio::time::timeout(SESSIONS_CLOSE_TIMEOUT, self.sessions.zero())
             .await
             .is_err()
         {
             warn!(
                 sessions = self.sessions.get(),
-                "Gladia sessions still open at exit"
+                "Azure Speech connections still open at exit"
             );
         }
     }
@@ -444,7 +521,7 @@ impl Agent {
                 } => {
                     let identity = participant.identity();
                     if let Some(old) = speakers.remove(&identity) {
-                        old.pump.abort();
+                        old.end();
                     }
                     match self
                         .start_speaker(Arc::clone(&room), &participant, track)
@@ -464,13 +541,21 @@ impl Agent {
                     ..
                 } => {
                     if let Some(old) = speakers.remove(&participant.identity()) {
-                        old.pump.abort();
+                        old.end();
+                    }
+                }
+                RoomEvent::ParticipantAttributesChanged {
+                    participant: Participant::Remote(participant),
+                    ..
+                } => {
+                    if let Some(speaker) = speakers.get_mut(&participant.identity()) {
+                        self.switch(&room, &participant, speaker).await;
                     }
                 }
                 RoomEvent::ParticipantConnected(_) => alone_until = None,
                 RoomEvent::ParticipantDisconnected(participant) => {
                     if let Some(old) = speakers.remove(&participant.identity()) {
-                        old.pump.abort();
+                        old.end();
                     }
                     // While the SDK reconnects it drops every participant; people coming back
                     // then reappear, so only a departure on a live connection ends the call.
@@ -503,7 +588,7 @@ impl Agent {
         };
 
         for speaker in speakers.into_values() {
-            speaker.pump.abort();
+            speaker.end();
         }
         room.close().await.ok();
         info!(room = room_name, "agent left");
@@ -563,60 +648,126 @@ impl Agent {
         let identity = participant.identity();
         let attributes = participant.attributes();
         // The attribute values are never logged: only whether they are usable.
-        let languages = attributes
+        let locales = attributes
             .get(&self.config.lang_attribute)
-            .and_then(|raw| parse_languages(raw))
+            .and_then(|raw| parse_locales(raw))
             .with_context(|| {
                 format!(
-                    "participant has no valid `{}` attribute",
+                    "participant has no valid `{}` attribute (one to 10 Azure locales)",
                     self.config.lang_attribute
                 )
             })?;
         let target = match attributes.get(&self.config.target_attribute) {
             None => None,
-            Some(raw) => match parse_languages(raw).as_deref() {
-                Some([one]) => Some(one.clone()),
-                _ => {
+            Some(raw) => match parse_target(raw) {
+                Some(target) => Some(target),
+                None => {
                     warn!(speaker = %identity.0, attribute = %self.config.target_attribute, "invalid target language, captions not translated");
                     None
                 }
             },
         };
-        let lang = languages.join(",");
+        let plan = Plan {
+            lang: locales.join(","),
+            locales,
+            target,
+        };
+        let session = if transcribes(attributes.get(&self.config.transcribe_attribute)) {
+            Some(self.open_session(room, &identity, &plan, &track))
+        } else {
+            info!(speaker = %identity.0, "transcription switched off, not captioning");
+            None
+        };
+        Ok(Speaker {
+            track,
+            plan,
+            session,
+        })
+    }
 
-        let session = self.gladia.open(&languages, target.as_deref()).await?;
-        info!(speaker = %identity.0, %lang, target = target.as_deref().unwrap_or("-"), session = %session.id, "captioning");
-        let translate = session.translate;
+    /// Stops or resumes `speaker`'s transcription when their transcribe attribute changed, and
+    /// tells the listeners.
+    async fn switch(
+        &self,
+        room: &Arc<Room>,
+        participant: &RemoteParticipant,
+        speaker: &mut Speaker,
+    ) {
+        let identity = participant.identity();
+        let on = transcribes(
+            participant
+                .attributes()
+                .get(&self.config.transcribe_attribute),
+        );
+        let status = match (on, speaker.session.take()) {
+            (false, Some(session)) => {
+                session.stop();
+                info!(speaker = %identity.0, "transcription switched off");
+                "stopped"
+            }
+            (true, None) => {
+                speaker.session = Some(self.open_session(
+                    Arc::clone(room),
+                    &identity,
+                    &speaker.plan,
+                    &speaker.track,
+                ));
+                info!(speaker = %identity.0, "transcription switched back on");
+                "resumed"
+            }
+            (_, session) => {
+                speaker.session = session;
+                return;
+            }
+        };
+        publish_status(room, &identity, status).await;
+    }
+
+    /// Opens an Azure Speech connection for `identity` and starts sending their audio to it.
+    fn open_session(
+        &self,
+        room: Arc<Room>,
+        identity: &ParticipantIdentity,
+        plan: &Plan,
+        track: &RemoteAudioTrack,
+    ) -> Session {
+        let session = new_id();
+        info!(speaker = %identity.0, lang = %plan.lang, target = plan.target.as_deref().unwrap_or("-"), %session, "captioning");
 
         let (audio_tx, audio_rx) = mpsc::channel::<Vec<u8>>(AUDIO_BUFFER);
         let (event_tx, event_rx) = mpsc::channel::<CaptionEvent>(64);
 
-        // The session ends when the audio channel closes (speaker gone, room left) or on error;
-        // either way it is then deleted. Only its id is logged.
-        self.sessions.increment();
-        let sessions = Arc::clone(&self.sessions);
-        let gladia = self.gladia.clone();
-        let session_id = session.id.clone();
-        tokio::spawn(async move {
-            if let Err(err) = run_session(session, audio_rx, event_tx).await {
-                warn!(session = %session_id, error = %format!("{err:#}"), "Gladia session ended");
+        // The connection ends when the audio channel closes (speaker gone, room left), when the
+        // speaker switches transcription off (the task is aborted) or after too many failed
+        // reconnections. Azure keeps neither the audio nor the text of a live transcription, so
+        // nothing is left to delete. Only the session id is logged.
+        let open = OpenSession::new(Arc::clone(&self.sessions));
+        let speech = self.speech.clone();
+        let locales = plan.locales.clone();
+        let speech = tokio::spawn(async move {
+            let _open = open;
+            match speech
+                .transcribe(&session, &locales, audio_rx, event_tx)
+                .await
+            {
+                Ok(()) => info!(%session, "Azure Speech session closed"),
+                Err(err) => {
+                    warn!(%session, error = %format!("{err:#}"), "Azure Speech session ended")
+                }
             }
-            match gladia.delete(&session_id).await {
-                Ok(()) => info!(session = %session_id, "Gladia session deleted"),
-                Err(_) => warn!(session = %session_id, "Gladia session not deleted, giving up"),
-            }
-            sessions.decrement();
         });
-        tokio::spawn(publish_captions(
+        let publisher = tokio::spawn(publish_captions(
             room,
             identity.clone(),
-            lang,
-            translate,
+            plan.lang.clone(),
+            plan.target.clone(),
+            self.translator.clone(),
             event_rx,
         ));
 
+        let rtc_track = track.rtc_track();
         let pump = tokio::spawn(async move {
-            let mut stream = NativeAudioStream::new(track.rtc_track(), SAMPLE_RATE as i32, 1);
+            let mut stream = NativeAudioStream::new(rtc_track, SAMPLE_RATE as i32, 1);
             let mut chunker = Chunker::default();
             while let Some(frame) = stream.next().await {
                 for chunk in chunker.push(&frame.data) {
@@ -627,43 +778,63 @@ impl Agent {
                 }
             }
         });
-        Ok(Speaker { pump })
+        Session {
+            pump,
+            speech,
+            publisher,
+        }
+    }
+}
+
+/// Tells everyone but `speaker` that their transcription stopped or resumed.
+async fn publish_status(room: &Room, speaker: &ParticipantIdentity, status: &'static str) {
+    let listeners: Vec<ParticipantIdentity> = room
+        .remote_participants()
+        .into_keys()
+        .filter(|id| id != speaker)
+        .collect();
+    if listeners.is_empty() {
+        return;
+    }
+    let payload = StatusPayload {
+        kind: "status",
+        speaker: &speaker.0,
+        status,
+    };
+    let Ok(bytes) = serde_json::to_vec(&payload) else {
+        return;
+    };
+    let packet = DataPacket {
+        payload: bytes,
+        topic: Some(TOPIC_CAPTIONS.to_owned()),
+        reliable: true,
+        destination_identities: listeners,
+    };
+    if let Err(err) = room.local_participant().publish_data(packet).await {
+        warn!(%err, "cannot send the transcription status");
     }
 }
 
 /// Sends a speaker's transcript back to them, and the translation (or the transcript) to everyone else.
+///
+/// Only finals that are not suspect reach the listeners. They are translated to `target`, unless
+/// they are already in it; a failed translation sends nothing.
 async fn publish_captions(
     room: Arc<Room>,
     speaker: ParticipantIdentity,
     lang: String,
-    translate: bool,
+    target: Option<String>,
+    translator: TranslatorClient,
     mut events: mpsc::Receiver<CaptionEvent>,
 ) {
-    let mut suspect_ids: HashSet<String> = HashSet::new();
-    while let Some(event) = events.recv().await {
-        let suspect = match event.kind {
-            CaptionKind::Partial => false,
-            CaptionKind::Final => {
-                let s = is_suspect(&event.text);
-                if s {
-                    suspect_ids.insert(event.utterance_id.clone());
-                }
-                s
-            }
-            CaptionKind::Translation => {
-                suspect_ids.contains(&event.utterance_id)
-                    || event.original.as_deref().is_some_and(is_suspect)
-            }
-        };
-        let payload = to_payload(&event, &speaker.0, &lang, suspect);
-        let Ok(bytes) = serde_json::to_vec(&payload) else {
-            continue;
-        };
-
+    while let Some(mut event) = events.recv().await {
+        if event.kind == CaptionKind::Final && is_suspect(&event.text) {
+            event.suspect = true;
+        }
         let local = room.local_participant();
-        if matches!(event.kind, CaptionKind::Partial | CaptionKind::Final) {
+        if let Some(bytes) = encode(&event, &speaker.0, &lang) {
             let packet = DataPacket {
-                payload: bytes.clone(),
+                payload: bytes,
                 topic: Some(TOPIC_SELF.to_owned()),
                 reliable: true,
                 destination_identities: vec![speaker.clone()],
@@ -672,20 +843,40 @@ async fn publish_captions(
                 warn!(%err, "cannot send transcript to speaker");
             }
         }
-
-        let for_listeners = match event.kind {
-            CaptionKind::Translation => true,
-            CaptionKind::Final => !translate,
-            CaptionKind::Partial => false,
-        };
-        if !for_listeners || suspect {
+        if event.kind != CaptionKind::Final || event.suspect {
             continue;
         }
+        let Some(detected) = event.language.clone() else {
+            continue;
+        };
+        let for_listeners = match target.as_deref() {
+            Some(to) if !same_language(&detected, to) => {
+                match translator
+                    .translate(&event.text, &translator_code(&detected), to)
+                    .await
+                {
+                    Ok(text) => CaptionEvent {
+                        kind: CaptionKind::Translation,
+                        original: Some(std::mem::take(&mut event.text)),
+                        text,
+                        ..event
+                    },
+                    Err(err) => {
+                        warn!(error = %format!("{err:#}"), "translation failed, caption not sent");
+                        continue;
+                    }
+                }
+            }
+            _ => event,
+        };
         let listeners: Vec<ParticipantIdentity> = room
             .remote_participants()
             .into_keys()
             .filter(|id| *id != speaker)
             .collect();
+        let Some(bytes) = encode(&for_listeners, &speaker.0, &lang) else {
+            continue;
+        };
         if listeners.is_empty() {
             continue;
         }
@@ -699,6 +890,10 @@ async fn publish_captions(
             warn!(%err, "cannot send captions");
         }
     }
+}
+
+fn encode(event: &CaptionEvent, speaker: &str, lang: &str) -> Option<Vec<u8>> {
+    serde_json::to_vec(&to_payload(event, speaker, lang)).ok()
 }
 
 /// Disconnections after which there is no room to come back to.
@@ -744,12 +939,7 @@ fn http_base(url: &str) -> String {
     }
 }
 
-fn to_payload<'a>(
-    event: &'a CaptionEvent,
-    speaker: &'a str,
-    lang: &'a str,
-    suspect: bool,
-) -> CaptionPayload<'a> {
+fn to_payload<'a>(event: &'a CaptionEvent, speaker: &'a str, lang: &'a str) -> CaptionPayload<'a> {
     CaptionPayload {
         id: &event.utterance_id,
         speaker,
@@ -763,7 +953,7 @@ fn to_payload<'a>(
         lang,
         detected_lang: event.language.as_deref(),
         confidence: event.confidence,
-        suspect,
+        suspect: event.suspect,
     }
 }
 
@@ -771,7 +961,32 @@ fn to_payload<'a>(
 mod tests {
     use std::time::Duration;
 
-    use super::{http_base, reconnect_delay, to_payload};
+    use super::{StatusPayload, http_base, reconnect_delay, to_payload, transcribes};
+
+    #[test]
+    fn only_on_or_no_attribute_lets_the_agent_transcribe() {
+        let value = |v: &str| Some(v.to_owned());
+        assert!(transcribes(None));
+        assert!(transcribes(value("on").as_ref()));
+        assert!(transcribes(value(" ON ").as_ref()));
+        assert!(transcribes(value("").as_ref()));
+        assert!(!transcribes(value("off").as_ref()));
+        assert!(!transcribes(value("no").as_ref()));
+    }
+
+    #[test]
+    fn the_status_message_names_the_speaker_and_the_status() -> anyhow::Result<()> {
+        let payload = StatusPayload {
+            kind: "status",
+            speaker: "aline",
+            status: "stopped",
+        };
+        assert_eq!(
+            serde_json::to_value(payload)?,
+            serde_json::json!({ "kind": "status", "speaker": "aline", "status": "stopped" })
+        );
+        Ok(())
+    }
 
     #[test]
     fn reconnection_delays_grow_and_stay_bounded() {
@@ -789,7 +1004,7 @@ mod tests {
         assert_eq!(http_base("ws://127.0.0.1:7880"), "http://127.0.0.1:7880");
         assert_eq!(http_base("https://lk.example"), "https://lk.example");
     }
-    use crate::gladia::{CaptionEvent, CaptionKind};
+    use crate::speech::{CaptionEvent, CaptionKind};
 
     #[test]
     fn payload_uses_camel_case_and_skips_empty_fields() -> anyhow::Result<()> {
@@ -798,12 +1013,14 @@ mod tests {
             kind: CaptionKind::Translation,
             text: "Je suis fatigué.".into(),
             original: Some("Vizaka aho.".into()),
-            language: Some("mg".into()),
+            language: Some("mg-MG".into()),
             confidence: None,
+            suspect: false,
         };
-        let json = serde_json::to_value(to_payload(&event, "aline", "mg", false))?;
+        let json = serde_json::to_value(to_payload(&event, "aline", "mg-MG"))?;
         assert_eq!(json["kind"], "translation");
-        assert_eq!(json["detectedLang"], "mg");
+        assert_eq!(json["detectedLang"], "mg-MG");
+        assert_eq!(json["suspect"], false);
         assert_eq!(json["original"], "Vizaka aho.");
         assert!(json.get("confidence").is_none());
         Ok(())

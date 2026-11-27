@@ -107,7 +107,9 @@ impl LiveKitServer {
             .unwrap();
         self.child = Some(child);
         let url = format!("http://127.0.0.1:{}/", self.port);
-        wait_until(Duration::from_secs(15), || async {
+        // Generous: a loaded machine (or a small CI runner) can take long to restart the server,
+        // and the tests are about the agent, not about how fast LiveKit starts.
+        wait_until(Duration::from_secs(30), || async {
             reqwest::get(&url)
                 .await
                 .is_ok_and(|r| r.status().is_success())
@@ -148,6 +150,30 @@ impl LiveKitServer {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Sets attributes of `identity` in `room` through `RoomService.UpdateParticipant`, as an
+    /// application server does. An empty value removes the attribute.
+    pub async fn set_attributes(&self, room: &str, identity: &str, attributes: &[(&str, &str)]) {
+        let attributes: serde_json::Map<String, Value> = attributes
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), Value::from(*v)))
+            .collect();
+        let body = self
+            .twirp(
+                "UpdateParticipant",
+                serde_json::json!({ "room": room, "identity": identity, "attributes": attributes }),
+                VideoGrants {
+                    room_admin: true,
+                    room: room.to_owned(),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert_eq!(
+            body["identity"], identity,
+            "UpdateParticipant answered {body}"
+        );
     }
 
     async fn twirp(&self, method: &str, body: Value, grants: VideoGrants) -> Value {
@@ -211,8 +237,8 @@ pub struct AgentProcess {
 }
 
 impl AgentProcess {
-    /// Starts `livecap serve` against `livekit_url` and `gladia_url`, plus `extra` variables.
-    pub async fn start(livekit_url: &str, gladia_url: &str, extra: &[(&str, &str)]) -> Self {
+    /// Starts `livecap serve` against `livekit_url` and the Azure fakes, plus `extra` variables.
+    pub async fn start(livekit_url: &str, azure: &super::Azure, extra: &[(&str, &str)]) -> Self {
         let port = free_tcp_port();
         let mut command = Command::new(env!("CARGO_BIN_EXE_livecap"));
         command
@@ -222,8 +248,11 @@ impl AgentProcess {
             .env("LIVEKIT_URL", livekit_url)
             .env("LIVEKIT_API_KEY", API_KEY)
             .env("LIVEKIT_API_SECRET", API_SECRET)
-            .env("GLADIA_API_KEY", "test-gladia-key")
-            .env("GLADIA_API_URL", gladia_url)
+            .env("AZURE_SPEECH_KEY", super::SPEECH_KEY)
+            .env("AZURE_SPEECH_URL", azure.speech.url())
+            .env("AZURE_TRANSLATOR_KEY", super::TRANSLATOR_KEY)
+            .env("AZURE_TRANSLATOR_REGION", super::TRANSLATOR_REGION)
+            .env("AZURE_TRANSLATOR_URL", azure.translator.url())
             .env("LIVECAP_JOIN_SECRET", JOIN_SECRET)
             .env("LIVECAP_LISTEN_ADDR", format!("127.0.0.1:{port}"))
             // Everything the agent logs, at the most verbose level an operator would use. The
@@ -331,21 +360,24 @@ pub fn token(identity: &str, room: &str, attributes: &[(&str, &str)]) -> String 
         .unwrap()
 }
 
-/// A participant publishing a 440 Hz tone on its microphone track.
+/// A participant publishing a 440 Hz tone on its microphone track, collecting its own
+/// transcript (`livecap.self`).
 pub struct Speaker {
     pub room: Room,
+    pub transcript: mpsc::UnboundedReceiver<Value>,
     tone: JoinHandle<()>,
 }
 
 impl Speaker {
     pub async fn join(url: &str, room: &str, identity: &str, attributes: &[(&str, &str)]) -> Self {
-        let (lk_room, _events) = Room::connect(
+        let (lk_room, events) = Room::connect(
             url,
             &token(identity, room, attributes),
             RoomOptions::default(),
         )
         .await
         .unwrap();
+        let transcript = collect_topic(events, "livecap.self");
         let source = NativeAudioSource::new(AudioSourceOptions::default(), 48_000, 1, 1000);
         let track =
             LocalAudioTrack::create_audio_track("mic", RtcAudioSource::Native(source.clone()));
@@ -382,8 +414,17 @@ impl Speaker {
         });
         Self {
             room: lk_room,
+            transcript,
             tone,
         }
+    }
+
+    /// Next message of the speaker's own transcript, or `None` after `timeout`.
+    pub async fn next_transcript(&mut self, timeout: Duration) -> Option<Value> {
+        tokio::time::timeout(timeout, self.transcript.recv())
+            .await
+            .ok()
+            .flatten()
     }
 
     pub async fn leave(self) {
@@ -400,26 +441,11 @@ pub struct Listener {
 
 impl Listener {
     pub async fn join(url: &str, room: &str, identity: &str, topic: &'static str) -> Self {
-        let (lk_room, mut events) =
+        let (lk_room, events) =
             Room::connect(url, &token(identity, room, &[]), RoomOptions::default())
                 .await
                 .unwrap();
-        let (tx, captions) = mpsc::unbounded_channel();
-        tokio::spawn(async move {
-            while let Some(event) = events.recv().await {
-                if let RoomEvent::DataReceived {
-                    payload,
-                    topic: Some(t),
-                    ..
-                } = event
-                    && t == topic
-                    && let Ok(value) = serde_json::from_slice::<Value>(&payload)
-                    && tx.send(value).is_err()
-                {
-                    return;
-                }
-            }
-        });
+        let captions = collect_topic(events, topic);
         Self {
             room: lk_room,
             captions,
@@ -442,6 +468,30 @@ impl Listener {
     pub async fn leave(self) {
         self.room.close().await.ok();
     }
+}
+
+/// Forwards the JSON messages received on `topic`.
+fn collect_topic(
+    mut events: mpsc::UnboundedReceiver<RoomEvent>,
+    topic: &'static str,
+) -> mpsc::UnboundedReceiver<Value> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(event) = events.recv().await {
+            if let RoomEvent::DataReceived {
+                payload,
+                topic: Some(t),
+                ..
+            } = event
+                && t == topic
+                && let Ok(value) = serde_json::from_slice::<Value>(&payload)
+                && tx.send(value).is_err()
+            {
+                return;
+            }
+        }
+    });
+    rx
 }
 
 /// Polls `check` until it is true; panics after `timeout`.

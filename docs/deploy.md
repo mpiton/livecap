@@ -1,6 +1,6 @@
 # Deploying livecap
 
-This guide runs livecap on one Linux server for two environments (here `preprod` and `production`), each as its own systemd service under its own user, with its own LiveKit and Gladia keys, behind [Caddy](https://caddyserver.com) for TLS. Releases are prebuilt binaries: nothing is compiled on the server.
+This guide runs livecap on one Linux server for two environments (here `preprod` and `production`), each as its own systemd service under its own user, with its own LiveKit and Azure keys, behind [Caddy](https://caddyserver.com) for TLS. Releases are prebuilt binaries: nothing is compiled on the server.
 
 The files referred to live in [`deploy/`](../deploy):
 
@@ -13,8 +13,8 @@ The files referred to live in [`deploy/`](../deploy):
 
 ## Server
 
-- Linux x86_64 with glibc 2.39 or later (Ubuntu 24.04, Debian 13 or newer): the release binary is built on Ubuntu 24.04. One small VPS (1 vCPU, 2 GB) is enough for a few rooms; livecap resamples audio and relays text, the speech-to-text runs at Gladia.
-- Outbound: HTTPS and WebSocket to LiveKit and to Gladia; WebRTC (UDP, with TCP and TURN fallbacks) to LiveKit.
+- Linux x86_64 with glibc 2.39 or later (Ubuntu 24.04, Debian 13 or newer): the release binary is built on Ubuntu 24.04. One small VPS (1 vCPU, 2 GB) is enough for a few rooms; livecap resamples audio and relays text, the speech-to-text and the translation run at Azure.
+- Outbound: HTTPS and WebSocket to LiveKit, WebSocket to Azure AI Speech (`<region>.stt.speech.microsoft.com`), HTTPS to Azure Translator; WebRTC (UDP, with TCP and TURN fallbacks) to LiveKit.
 - Inbound: 80 and 443 for Caddy only. livecap itself listens on the loopback interface.
 
 ## Users and directories
@@ -41,7 +41,7 @@ sudo install -m 0600 -o root -g root deploy/livecap.env.example /etc/livecap/pro
 sudoedit /etc/livecap/preprod.env /etc/livecap/production.env
 ```
 
-Fill in for each environment its own LiveKit project (`LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`), its own Gladia key (`GLADIA_API_KEY`), a random `LIVECAP_JOIN_SECRET` (`openssl rand -hex 32`) shared with the application that calls `join`, and a distinct loopback port: `LIVECAP_LISTEN_ADDR=127.0.0.1:8791` for `preprod`, `127.0.0.1:8792` for `production`. Every variable is described in the [README](../README.md#running). The Gladia key lives in these files only.
+Fill in for each environment its own LiveKit project (`LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`), its own Azure keys (`AZURE_SPEECH_KEY`, `AZURE_TRANSLATOR_KEY`, with `AZURE_TRANSLATOR_REGION`), a random `LIVECAP_JOIN_SECRET` (`openssl rand -hex 32`) shared with the application that calls `join`, and a distinct loopback port: `LIVECAP_LISTEN_ADDR=127.0.0.1:8791` for `preprod`, `127.0.0.1:8792` for `production`. Every variable is described in the [README](../README.md#running). The Azure keys live in these files only.
 
 ## systemd
 
@@ -54,8 +54,11 @@ The template unit gives each instance `livecap@<environment>`:
 
 - `User=livecap-<environment>`, `EnvironmentFile=/etc/livecap/<environment>.env`, `ExecStart=/opt/livecap/<environment>/current/livecap serve`;
 - `Restart=always`, so a crash or an unexpected exit restarts it after two seconds;
-- `KillSignal=SIGTERM` and `TimeoutStopSec=2h 5min`. On SIGTERM livecap drains: it answers `503 draining` to new joins, lets the calls in progress end, for at most `LIVECAP_DRAIN_TIMEOUT_SECS` (two hours by default), deletes their Gladia sessions, and exits. The stop timeout must stay above the drain timeout plus about 30 seconds, or systemd kills calls in progress. To stop at once anyway, send a second signal: `sudo systemctl kill --signal=SIGTERM livecap@preprod`;
-- a sandbox (`ProtectSystem=strict`, no capabilities, no new privileges...): livecap only needs the network.
+- `KillSignal=SIGTERM` and `TimeoutStopSec=2h 5min`. On SIGTERM livecap drains: it answers `503 draining` to new joins, lets the calls in progress end, for at most `LIVECAP_DRAIN_TIMEOUT_SECS` (two hours by default), ends their Azure connections, and exits. The stop timeout must stay above the drain timeout plus about 30 seconds, or systemd kills calls in progress. To stop at once anyway, send a second signal: `sudo systemctl kill --signal=SIGTERM livecap@preprod`;
+- a sandbox (`ProtectSystem=strict`, `ProtectHome`, no capabilities, no new privileges...): livecap only needs the network;
+- `CPUWeight=500` and `MemoryMax=1G`, for a host shared with other workloads: captions keep priority on the CPU over builds and tests, and livecap cannot exhaust the host's memory. Raise `MemoryMax` with `LIVECAP_MAX_ROOMS`.
+
+On a shared host, also keep the environment files and `/opt/livecap` out of other users' reach (the commands above do), and never give the `livecap-*` users a login shell or a home directory with other secrets.
 
 Install the first release (see [Updating](#updating)), then enable both instances:
 
@@ -82,7 +85,7 @@ The application calls `POST https://<address>/rooms/{room}/join` with `Authoriza
 
 ## Logs
 
-livecap logs to the journal (`journalctl -u livecap@production`). At the default `RUST_LOG=info` it logs room names, participant identities, Gladia session ids, language codes, counts and errors. It never logs what people say: no transcript, no translation, no attribute value it refuses. An integration test (`no_transcript_or_translation_text_reaches_the_logs`) runs a call and searches the captured logs for the caption text.
+livecap logs to the journal (`journalctl -u livecap@production`). At the default `RUST_LOG=info` it logs room names, participant identities, Azure session and connection ids, locales, counts and errors. It never logs what people say: no transcript, no translation, no attribute value it refuses, no key. An integration test (`no_text_and_no_key_reach_the_logs`) runs a call and searches the captured logs for the caption text and the keys.
 
 - Keep `RUST_LOG=info`. At `debug`, the LiveKit SDK prints whole signalling messages, including participant attributes and TURN credentials. To debug livecap itself, use `RUST_LOG=debug,livekit=info,livekit_api=info,libwebrtc=info`, which is what the tests check.
 - The LiveKit SDK logs its own reconnection attempts as `ERROR` lines during an outage; they carry no content.
@@ -120,8 +123,8 @@ sudo systemctl restart --no-block livecap@production
 
 ## Checklist
 
-- [ ] Two users `livecap-preprod` and `livecap-production`, two `/etc/livecap/*.env` files in mode 0600, each with its own LiveKit and Gladia keys and its own port.
+- [ ] Two users `livecap-preprod` and `livecap-production`, two `/etc/livecap/*.env` files in mode 0600, each with its own LiveKit and Azure keys and its own port.
 - [ ] `livecap@preprod` and `livecap@production` enabled; `systemctl show -p Restart,TimeoutStopUSec livecap@production` shows `Restart=always` and a stop timeout above the drain timeout.
 - [ ] Caddy serves one address per environment over HTTPS, without access logs; `/health` answers through it.
 - [ ] `RUST_LOG=info` in both environment files; journal retention bounded.
-- [ ] Gladia data retention: livecap deletes every session when it ends; the Gladia account settings (training on customer data) are checked separately.
+- [ ] Azure data retention: real-time transcription keeps neither audio nor text and livecap never sets `storeAudio`; the Speech and Translator resources are in the expected region, and no logging is turned on in their settings.

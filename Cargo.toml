@@ -1,6 +1,6 @@
 [package]
 name = "livecap"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Live translated captions for LiveKit calls: a hidden Rust agent that streams each speaker to a speech-to-text service and publishes captions back to the room."

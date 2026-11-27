@@ -20,11 +20,17 @@ Restart=always
 RestartSec=2
 
 # Graceful stop: on SIGTERM livecap takes no new room, lets the calls in progress end (at most
-# LIVECAP_DRAIN_TIMEOUT_SECS, 2 h by default), deletes their Gladia sessions, then exits.
+# LIVECAP_DRAIN_TIMEOUT_SECS, 2 h by default), ends their Azure connections, then exits.
 # The stop timeout must stay above the drain timeout, or systemd kills calls in progress.
 KillSignal=SIGTERM
 KillMode=mixed
 TimeoutStopSec=2h 5min
+
+# On a host shared with other workloads (builds, tests), captions keep priority on the CPU and
+# livecap cannot take the host's memory. 1 GiB holds the default room cap (15 rooms, two voices
+# each) with room to spare; raise it with LIVECAP_MAX_ROOMS.
+CPUWeight=500
+MemoryMax=1G
 
 # Logs go to the journal; livecap never logs caption text (see docs/deploy.md, Logs).
 StandardOutput=journal
