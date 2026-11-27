@@ -118,7 +118,7 @@ async fn turning_transcription_off_closes_the_connection_and_tells_the_listeners
     let closed = logs
         .lines()
         .find(|l| l.contains("Azure Speech session closed") && l.contains(&session))
-        .unwrap_or_else(|| panic!("no closed line for session {session}: {logs}"));
+        .expect("no `Azure Speech session closed` line with the session id of `captioning`");
     assert!(closed.contains("speaker=speaker"), "{closed}");
     assert!(closed.contains("transcription switched off"), "{closed}");
     speaker.leave().await;
