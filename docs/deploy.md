@@ -114,10 +114,10 @@ The checksum guards against a corrupted or truncated download; it comes from the
 
 ### Rolling back
 
-Run the script with the previous tag (`sudo livecap-update production v0.1.0`), or point `current` back at a release still on disk and restart:
+Run the script with the previous tag (for instance `sudo livecap-update production v0.2.0` once `v0.2.1` is installed), or point `current` back at a release still on disk and restart. `v0.2.0` is the first tag with a release binary: there is nothing older to roll back to.
 
 ```bash
-sudo ln -sfn releases/v0.1.0 /opt/livecap/production/current
+sudo ln -sfn releases/v0.2.0 /opt/livecap/production/current
 sudo systemctl restart --no-block livecap@production
 ```
 

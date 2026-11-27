@@ -199,7 +199,7 @@ Azure AI Speech, real-time speech to text (S0, November 2026): about €0.90 per
 
 1. Run the canary (above) against the real Azure on the commit to tag, and note the result in the release issue.
 2. Make sure the `version` of `Cargo.toml` is the version to release (the release workflow refuses a tag that does not match it).
-3. `git tag vX.Y.Z && git push origin vX.Y.Z`: [.github/workflows/release.yml](.github/workflows/release.yml) runs the tests, builds `livecap-x86_64-unknown-linux-gnu` with clang 21, and publishes it with its `.sha256` in a GitHub release.
+3. `git tag -a vX.Y.Z -m 'vX.Y.Z: <summary>' && git push origin vX.Y.Z`: [.github/workflows/release.yml](.github/workflows/release.yml) runs the tests, builds `livecap-x86_64-unknown-linux-gnu` with clang 21, and publishes it with its `.sha256` in a GitHub release.
 4. Install it with the update script of [docs/deploy.md](docs/deploy.md#updating), `preprod` first.
 
 ## Roadmap
