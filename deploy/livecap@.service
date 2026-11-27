@@ -20,7 +20,7 @@ Restart=always
 RestartSec=2
 
 # Graceful stop: on SIGTERM livecap takes no new room, lets the calls in progress end (at most
-# LIVECAP_DRAIN_TIMEOUT_SECS, 2 h by default), deletes their Gladia sessions, then exits.
+# LIVECAP_DRAIN_TIMEOUT_SECS, 2 h by default), ends their Azure connections, then exits.
 # The stop timeout must stay above the drain timeout, or systemd kills calls in progress.
 KillSignal=SIGTERM
 KillMode=mixed

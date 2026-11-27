@@ -39,6 +39,7 @@ jobs:
           echo "${LIVEKIT_SHA256}  $dir/$archive" | sha256sum --check --strict
           tar -xzf "$dir/$archive" -C "$dir" livekit-server
           echo "LIVEKIT_SERVER_BIN=$dir/livekit-server" >> "$GITHUB_ENV"
-      # Unit tests, the Gladia client against the fake Gladia, and the agent against the fake
-      # Gladia and livekit-server --dev. On CI a missing LIVEKIT_SERVER_BIN fails the tests.
+      # Unit tests, the Azure clients against the fake Azure Speech and Translator, and the agent
+      # against those fakes and livekit-server --dev. On CI a missing LIVEKIT_SERVER_BIN fails the
+      # tests. The canary against the real Azure (tests/canary.rs) is ignored and never runs here.
       - run: cargo test --locked
