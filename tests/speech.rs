@@ -379,7 +379,7 @@ async fn translator_requests_name_the_languages_the_key_and_the_region() {
     assert_eq!(r.key.as_deref(), Some("translator-key-1"));
     assert_eq!(r.region.as_deref(), Some("francecentral"));
     assert_eq!(r.content_type.as_deref(), Some("application/json"));
-    assert_eq!(r.body, json!([{ "Text": "Bonjour" }]));
+    assert_eq!(r.body, json!([{ "Text": "Bonjour" }]).to_string());
 
     let global = TranslatorClient::new(&fake.url(), "translator-key-1", None);
     global.translate("Bonjour", "fr", "en").await.unwrap();
@@ -407,5 +407,8 @@ async fn translator_errors_carry_neither_the_text_nor_the_key() {
         .json()
         .await
         .unwrap();
-    assert_eq!(replay[0]["body"], json!([{ "Text": "Private words" }]));
+    assert_eq!(
+        replay[0]["body"],
+        json!([{ "Text": "Private words" }]).to_string()
+    );
 }

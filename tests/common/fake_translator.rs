@@ -13,7 +13,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::json;
 use tokio::net::TcpListener;
 
 /// Translation sent for every request. Unique words, so a test can look for them in logs.
@@ -26,7 +26,8 @@ pub struct Request {
     pub key: Option<String>,
     pub region: Option<String>,
     pub content_type: Option<String>,
-    pub body: Value,
+    /// The raw body, as received: tests compare it with the JSON they expect, serialized.
+    pub body: String,
 }
 
 #[derive(Default)]
@@ -99,7 +100,7 @@ async fn translate(
         key: header(&headers, "ocp-apim-subscription-key"),
         region: header(&headers, "ocp-apim-subscription-region"),
         content_type: header(&headers, "content-type"),
-        body: serde_json::from_str(&body).unwrap_or(Value::String(body)),
+        body,
     });
     let query = query.unwrap_or_default();
     let params: Vec<(&str, &str)> = query

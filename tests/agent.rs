@@ -359,7 +359,10 @@ async fn finals_are_translated_with_the_detected_language_and_the_target() {
     assert_eq!(r.query.as_deref(), Some("api-version=3.0&from=en&to=fr"));
     assert_eq!(r.key.as_deref(), Some(TRANSLATOR_KEY));
     assert_eq!(r.region.as_deref(), Some(TRANSLATOR_REGION));
-    assert_eq!(r.body, serde_json::json!([{ "Text": TRANSCRIPT }]));
+    assert_eq!(
+        r.body,
+        serde_json::json!([{ "Text": TRANSCRIPT }]).to_string()
+    );
 
     // Translator fails: no caption at all, the partials and finals still reach the speaker.
     azure.translator.set_failing(true);

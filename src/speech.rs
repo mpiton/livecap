@@ -686,7 +686,9 @@ fn to_event(
             let declared = language
                 .as_deref()
                 .is_some_and(|l| locales.iter().any(|d| d.eq_ignore_ascii_case(l)));
-            let confident = confidence.is_none_or(|c| c >= min_confidence);
+            // A final without a confidence is not trusted: with one locale the threshold is the
+            // only guard against an uncovered language transcribed as the declared one.
+            let confident = confidence.is_some_and(|c| c >= min_confidence);
             // `src/common.speech/ServiceMessages/Enums.ts`, `RecognitionStatus`.
             let suspect = status != "Success" || !confident || !declared;
             Some(CaptionEvent {
@@ -980,6 +982,35 @@ mod tests {
             suspect(phrase("Success", 0.9, None), &one, &mut u),
             Some(false)
         );
+    }
+
+    #[test]
+    fn with_one_locale_only_the_status_and_the_confidence_guard() {
+        // Azure transcribes everything as the one declared locale and names no other language:
+        // another language spoken (Malagasy for a `fr-FR` speaker) can only be caught by its
+        // confidence.
+        let mut u = Utterances::new("S");
+        let one = locales(&["fr-FR"]);
+        let suspect =
+            |answer, u: &mut Utterances| to_event(answer, &one, 0.5, u).map(|e| e.suspect);
+        assert_eq!(suspect(phrase("Success", 0.6, None), &mut u), Some(false));
+        assert_eq!(suspect(phrase("Success", 0.4, None), &mut u), Some(true));
+        assert_eq!(
+            suspect(phrase("Success", 0.9, Some("fr-FR")), &mut u),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn a_final_without_a_confidence_is_suspect() -> anyhow::Result<()> {
+        let mut u = Utterances::new("S");
+        let one = locales(&["fr-FR"]);
+        let body = r#"{"RecognitionStatus":"Success","DisplayText":"Bonjour."}"#;
+        let fin = to_event(parse_answer("speech.phrase", body)?, &one, 0.5, &mut u)
+            .ok_or_else(|| anyhow::anyhow!("none"))?;
+        assert_eq!(fin.confidence, None);
+        assert!(fin.suspect);
+        Ok(())
     }
 
     #[test]

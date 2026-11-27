@@ -107,7 +107,9 @@ impl LiveKitServer {
             .unwrap();
         self.child = Some(child);
         let url = format!("http://127.0.0.1:{}/", self.port);
-        wait_until(Duration::from_secs(15), || async {
+        // Generous: a loaded machine (or a small CI runner) can take long to restart the server,
+        // and the tests are about the agent, not about how fast LiveKit starts.
+        wait_until(Duration::from_secs(30), || async {
             reqwest::get(&url)
                 .await
                 .is_ok_and(|r| r.status().is_success())
