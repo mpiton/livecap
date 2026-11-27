@@ -11,6 +11,10 @@ const EXACT: &[&str] = &[
     "thanks for watching!",
     "t-series",
     "shabbat shalom",
+    // A lone article: what Azure made of a breath in Malagasy heard as English
+    // (mpiton/crossluv#962, confidence 0.77). Never a caption worth showing on its own.
+    "the",
+    "the.",
 ];
 
 const CONTAINS: &[&str] = &["amara.org", "sous-titrage", "sous-titres réalisés"];
@@ -35,6 +39,7 @@ mod tests {
         assert!(is_suspect("T-Series"));
         assert!(is_suspect("..."));
         assert!(is_suspect("Sous-titrage ST' 501"));
+        assert!(is_suspect("The."));
     }
 
     #[test]
@@ -44,5 +49,6 @@ mod tests {
             "Je vais aller chercher un petit peu de baguette."
         ));
         assert!(!is_suspect("Misaotra"));
+        assert!(!is_suspect("The end."));
     }
 }

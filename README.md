@@ -18,7 +18,7 @@ listener ◄──captions──┴── data message ─┘
 
 ## Status
 
-Young, but meant for production: v0.2.0 moves to Azure AI Speech (configurable region, `francecentral` by default) and Azure Translator, with several locales per speaker, suspect finals kept from listeners, a `join` that answers only once the agent is in the room, a room cap, a graceful stop and recovery from LiveKit and Azure outages. CI runs every change against a fake Azure AI Speech, a fake Azure Translator and a local `livekit-server --dev`. Tagged releases publish a Linux x86_64 binary; see [docs/deploy.md](docs/deploy.md) to run it with systemd and Caddy. Expect breaking changes before 1.0.
+Young, but meant for production (v0.2.1): v0.2 moved to Azure AI Speech (configurable region, `francecentral` by default) and Azure Translator, with several locales per speaker, suspect finals kept from listeners, a `join` that answers only once the agent is in the room, a room cap, a graceful stop and recovery from LiveKit and Azure outages. CI runs every change against a fake Azure AI Speech, a fake Azure Translator and a local `livekit-server --dev`. Tagged releases publish a Linux x86_64 binary; see [docs/deploy.md](docs/deploy.md) to run it with systemd and Caddy. Expect breaking changes before 1.0.
 
 ## How it works
 
@@ -32,7 +32,7 @@ Young, but meant for production: v0.2.0 moves to Azure AI Speech (configurable r
 4. It publishes, as JSON data messages:
    - on topic `livecap.self`, to the speaker only: their own live transcript (partials and finals);
    - on topic `livecap.captions`, to everyone else: each final translated by Azure Translator into `livecap.target`, or the final itself when it is already in that language (no Translator call then) or there is no target. When Translator fails, that sentence is not sent; the log says so without the text.
-5. A final is flagged `suspect` and never sent to listeners nor translated when Azure did not recognize it (`RecognitionStatus` other than `Success`), when its confidence is under `AZURE_SPEECH_MIN_CONFIDENCE`, when it has no confidence, or, for a speaker with two locales or more, when the detected language is not one of them: a language Azure does not cover, spoken by someone who declared another one, must not turn into made-up text. With a single locale Azure transcribes everything as that locale and detects nothing, so only the status and the confidence threshold guard: measure `AZURE_SPEECH_MIN_CONFIDENCE` on real speech in the languages your speakers may use without declaring them. The speaker still sees it on `livecap.self`.
+5. A final is flagged `suspect` and never sent to listeners nor translated when Azure did not recognize it (`RecognitionStatus` other than `Success`), when its confidence is under `AZURE_SPEECH_MIN_CONFIDENCE`, when it has no confidence, or, for a speaker with two locales or more, when the detected language is not one of them: a language Azure does not cover, spoken by someone who declared another one, must not turn into made-up text. With two locales or more (continuous language detection), Azure sometimes returns a confidence of exactly 0.9 that measures nothing (made-up text from an uncovered language gets it, with every word at 0.0): such a final, or one without a phrase confidence, is judged on the mean confidence of its words (`NBest[0].Words[].Confidence`, asked for with `WordTimings`), and is `suspect` when Azure sent no word confidence. With a single locale Azure transcribes everything as that locale and detects nothing, so only the status and the confidence threshold guard: measure `AZURE_SPEECH_MIN_CONFIDENCE` on real speech in the languages your speakers may use without declaring them. The speaker still sees it on `livecap.self`.
 6. When Azure closes or drops the connection mid-call, the agent reconnects with a doubling delay (0.5 s up to 8 s); after 8 failures in a row it stops captioning that speaker, without affecting the room. Live transcription keeps neither the audio nor the text at Azure; livecap never turns on audio logging (`storeAudio`) and never asks Azure for diarization or speaker identification.
 7. It leaves when the last participant does, or after 20 seconds alone in a room.
 
@@ -127,7 +127,7 @@ cargo run --release -- join my-room     # or join one room and exit when it empt
 - `GET /health` answers `200` with the version and the load, never a room name:
 
   ```json
-  { "status": "ok", "version": "0.2.0", "rooms": 1, "sessions": 2, "maxRooms": 15 }
+  { "status": "ok", "version": "0.2.1", "rooms": 1, "sessions": 2, "maxRooms": 15 }
   ```
 
   `status` is `draining` once the agent is stopping.
@@ -162,7 +162,7 @@ cargo test
 
 runs the unit tests and the integration tests under `tests/`. None of them calls Azure or LiveKit Cloud:
 
-- `tests/common/fake_speech.rs` is a fake Azure AI Speech: it accepts the Speech SDK WebSocket on `/stt/speech/universal/v2` (and the one-language `/speech/recognition/conversation/cognitiveservices/v1`), records the URL, the headers, `speech.config`, `speech.context` and the audio frames (RIFF header, then PCM), answers with `speech.hypothesis`, `speech.phrase` (confidence, detected language) and `turn.end` written in advance, can send a low-confidence or undeclared-language final and cut connections mid-stream, and replays what it received on `GET /calls`. The agent is pointed at it with `AZURE_SPEECH_URL`.
+- `tests/common/fake_speech.rs` is a fake Azure AI Speech: it accepts the Speech SDK WebSocket on `/stt/speech/universal/v2` (and the one-language `/speech/recognition/conversation/cognitiveservices/v1`), records the URL, the headers, `speech.config`, `speech.context` and the audio frames (RIFF header, then PCM), answers with `speech.hypothesis`, `speech.phrase` (confidence, detected language, optional word confidences) and `turn.end` written in advance, can send a low-confidence, placeholder-confidence (0.9) or undeclared-language final and cut connections mid-stream, and replays what it received on `GET /calls`. The agent is pointed at it with `AZURE_SPEECH_URL`.
 - `tests/common/fake_translator.rs` is a fake Azure Translator: `POST /translate?api-version=3.0` records the key and region headers, `from`, `to` and the text, and answers a translation written in advance, or an error on demand. The agent is pointed at it with `AZURE_TRANSLATOR_URL`.
 - `tests/speech.rs` drives the Azure clients against those fakes and pins what they send.
 - `tests/transcribe.rs` runs the binary the same way and switches a speaker's transcription off and on through `RoomService.UpdateParticipant`, as an application does.

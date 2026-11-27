@@ -207,6 +207,8 @@ struct Plan {
 
 /// One open transcription: the audio pump, the Azure Speech connection and the publisher.
 struct Session {
+    /// Session id, the one logged with `captioning` and by the Azure Speech client.
+    id: String,
     pump: JoinHandle<()>,
     speech: JoinHandle<()>,
     publisher: JoinHandle<()>,
@@ -215,10 +217,17 @@ struct Session {
 impl Session {
     /// Stops at once: no more audio to Azure, the connection dropped without waiting for the
     /// last results, nothing more translated or published.
-    fn stop(self) {
+    ///
+    /// Logs `Azure Speech session closed` with the speaker and the session id only, like the end
+    /// of a call: the aborted task never reaches its own log line (mpiton/crossluv#963). The line
+    /// is written once the speech task is gone, so its WebSocket is dropped by then.
+    async fn stop(self, speaker: &ParticipantIdentity) {
         self.pump.abort();
         self.speech.abort();
         self.publisher.abort();
+        // An aborted task resolves to a cancellation error once it is dropped: nothing to report.
+        let _ = self.speech.await;
+        info!(speaker = %speaker.0, session = %self.id, reason = "transcription switched off", "Azure Speech session closed");
     }
 }
 
@@ -701,8 +710,8 @@ impl Agent {
         );
         let status = match (on, speaker.session.take()) {
             (false, Some(session)) => {
-                session.stop();
                 info!(speaker = %identity.0, "transcription switched off");
+                session.stop(&identity).await;
                 "stopped"
             }
             (true, None) => {
@@ -744,6 +753,7 @@ impl Agent {
         let open = OpenSession::new(Arc::clone(&self.sessions));
         let speech = self.speech.clone();
         let locales = plan.locales.clone();
+        let id = session.clone();
         let speech = tokio::spawn(async move {
             let _open = open;
             match speech
@@ -779,6 +789,7 @@ impl Agent {
             }
         });
         Session {
+            id,
             pump,
             speech,
             publisher,

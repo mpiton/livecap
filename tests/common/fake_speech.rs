@@ -3,8 +3,8 @@
 //! It accepts `/stt/speech/universal/v2` (and the one-language
 //! `/speech/recognition/conversation/cognitiveservices/v1`), records the handshake (path, query,
 //! headers), `speech.config`, every `speech.context` and the audio frames (the RIFF header first,
-//! then PCM), and answers with `turn.start`, `speech.hypothesis`, `speech.phrase` and `turn.end`
-//! written in advance. It can cut connections in mid-stream. What it received is in `calls()` and
+//! then PCM), and answers with `turn.start`, `speech.hypothesis`, `speech.phrase` (optionally with
+//! word confidences) and `turn.end` written in advance. It can cut connections in mid-stream. What it received is in `calls()` and
 //! on `GET /calls` of its HTTP side.
 
 use std::collections::BTreeMap;
@@ -37,6 +37,9 @@ pub struct Phrase {
     pub confidence: f64,
     /// `PrimaryLanguage.Language`, omitted when `None`.
     pub language: Option<&'static str>,
+    /// Confidence of each word of `NBest[0].Words`, as Azure sends them in continuous language
+    /// detection; no `Words` when `None`. `Some(None)` entries are words without a confidence.
+    pub words: Option<Vec<Option<f64>>>,
 }
 
 impl Default for Phrase {
@@ -45,6 +48,7 @@ impl Default for Phrase {
             status: "Success",
             confidence: 0.93,
             language: Some("en-US"),
+            words: None,
         }
     }
 }
@@ -399,6 +403,26 @@ fn script(request_id: &str, phrase: &Phrase) -> Vec<Message> {
             "Display": TRANSCRIPT
         }]
     });
+    if let Some(words) = &phrase.words {
+        let words: Vec<Value> = TRANSCRIPT
+            .split(' ')
+            .cycle()
+            .zip(words)
+            .enumerate()
+            .map(|(i, (word, confidence))| {
+                let mut word = json!({
+                    "Word": word.to_lowercase(),
+                    "Offset": 1_000_000 + i * 1_000_000,
+                    "Duration": 900_000
+                });
+                if let Some(confidence) = confidence {
+                    word["Confidence"] = json!(confidence);
+                }
+                word
+            })
+            .collect();
+        final_phrase["NBest"][0]["Words"] = Value::Array(words);
+    }
     if let Some(language) = language {
         hypothesis["PrimaryLanguage"] = language.clone();
         final_phrase["PrimaryLanguage"] = language;

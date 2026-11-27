@@ -88,6 +88,7 @@ The application calls `POST https://<address>/rooms/{room}/join` with `Authoriza
 livecap logs to the journal (`journalctl -u livecap@production`). At the default `RUST_LOG=info` it logs room names, participant identities, Azure session and connection ids, locales, counts and errors. It never logs what people say: no transcript, no translation, no attribute value it refuses, no key. An integration test (`no_text_and_no_key_reach_the_logs`) runs a call and searches the captured logs for the caption text and the keys.
 
 - Keep `RUST_LOG=info`. At `debug`, the LiveKit SDK prints whole signalling messages, including participant attributes and TURN credentials. To debug livecap itself, use `RUST_LOG=debug,livekit=info,livekit_api=info,libwebrtc=info`, which is what the tests check.
+- An Azure Speech session that ends normally logs `Azure Speech session closed session=<id>`: when the call or the speaker ends, and when the speaker switches their transcription off (`reason="transcription switched off"`, with the speaker identity). One given up after failed reconnections logs `WARN ... Azure Speech session ended` with the error instead. Neither carries content; the first proves no more of that voice goes to Microsoft.
 - The LiveKit SDK logs its own reconnection attempts as `ERROR` lines during an outage; they carry no content.
 - Bound the journal's retention, for instance in `/etc/systemd/journald.conf.d/retention.conf`:
 

@@ -306,6 +306,23 @@ async fn suspect_finals_never_reach_the_listeners_nor_the_translator() {
         }
     };
     assert_eq!(unconfident["suspect"], true, "{unconfident}");
+    // Then Azure's placeholder confidence of continuous language detection (0.9) on invented
+    // text whose words are all at 0.0, and without any word confidence (mpiton/crossluv#962).
+    for words in [Some(vec![Some(0.0); 4]), None] {
+        azure.speech.set_phrase(Phrase {
+            language: Some("en-US"),
+            confidence: 0.9,
+            words: words.clone(),
+            ..Phrase::default()
+        });
+        let placeholder = loop {
+            let message = speaker.next_transcript(WAIT).await.expect("no transcript");
+            if message["kind"] == "final" && message["detectedLang"] == "en-US" {
+                break message;
+            }
+        };
+        assert_eq!(placeholder["suspect"], true, "{words:?}: {placeholder}");
+    }
     assert!(listener.next(Duration::from_secs(2)).await.is_none());
     assert!(azure.translator.requests().is_empty());
     speaker.leave().await;
