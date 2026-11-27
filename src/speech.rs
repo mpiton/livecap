@@ -644,15 +644,19 @@ struct Word {
     confidence: Option<f32>,
 }
 
-/// Mean confidence of the words that carry one, or `None` when none does.
+/// Mean confidence of `words`, or `None` when there are none or none carries a confidence.
+///
+/// A word without `Confidence` among words that have one counts as 0.0: the service leaves the
+/// field out when it is zero (livecap's client saw placeholder finals whose words had no
+/// confidence where the Speech SDK showed 0.0), and skipping those words would lift the mean.
 fn mean_confidence(words: &[Word]) -> Option<f32> {
-    let known: Vec<f32> = words.iter().filter_map(|w| w.confidence).collect();
-    if known.is_empty() {
+    if words.iter().all(|w| w.confidence.is_none()) {
         return None;
     }
+    let sum: f32 = words.iter().filter_map(|w| w.confidence).sum();
     // A phrase has a few dozen words, far below 2^24: the count is exact as an `f32`.
-    let count = known.len() as f32;
-    Some(known.iter().sum::<f32>() / count)
+    let count = words.len() as f32;
+    Some(sum / count)
 }
 
 #[derive(Deserialize)]
@@ -1075,6 +1079,14 @@ mod tests {
         assert_eq!(judge(wordless, &two)?, (None, true));
         let missing = r#"{"RecognitionStatus":"Success","PrimaryLanguage":{"Language":"en-US"},"NBest":[{"Display":"For translation.","Words":[{"Word":"for","Confidence":0.8}]}]}"#;
         assert_eq!(judge(missing, &two)?, (Some(0.8), false));
+        // A word without a confidence among others is a zero the service left out.
+        let mixed = r#"{"RecognitionStatus":"Success","PrimaryLanguage":{"Language":"en-US"},"NBest":[{"Confidence":0.9,"Display":"Mandi Manaf Kya.","Words":[{"Word":"mandi"},{"Word":"manaf"},{"Word":"kya","Confidence":0.9}]}]}"#;
+        let (confidence, suspect) = judge(mixed, &two)?;
+        assert!(suspect);
+        assert!(
+            confidence.is_some_and(|c| (c - 0.3).abs() < 1e-6),
+            "{confidence:?}"
+        );
 
         // A measured phrase confidence is kept, whatever its words say.
         let measured = r#"{"RecognitionStatus":"Success","PrimaryLanguage":{"Language":"fr-FR"},"NBest":[{"Confidence":0.78,"Display":"Bonjour.","Words":[{"Word":"bonjour","Confidence":0.1}]}]}"#;

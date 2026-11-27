@@ -219,7 +219,9 @@ impl Session {
     /// last results, nothing more translated or published.
     ///
     /// Logs `Azure Speech session closed` with the speaker and the session id only, like the end
-    /// of a call: the aborted task never reaches its own log line (mpiton/crossluv#963).
+    /// of a call: the aborted task never reaches its own log line (mpiton/crossluv#963). The line
+    /// is written when the abort is requested; the socket is dropped the next time the runtime
+    /// polls the task, and no audio follows since the pump is aborted first.
     fn stop(self, speaker: &ParticipantIdentity) {
         self.pump.abort();
         self.speech.abort();
